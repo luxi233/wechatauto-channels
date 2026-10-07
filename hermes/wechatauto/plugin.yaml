@@ -1,0 +1,52 @@
+name: wechatauto
+label: WeChat Local
+kind: platform
+version: 0.1.0
+description: >
+  WeChat 4.x personal-account adapter driven by wechatauto-replica on the
+  local Windows client (DB decryption in, UIA+OCR out). Complements the
+  built-in ``weixin`` (iLink) platform: works with group chats and needs no
+  Tencent-side approval, but requires Windows + a logged-in WeChat client.
+author: wechatauto-channels
+# 所有配置均为可选：账号自动探测，登录态=微信客户端本身。
+optional_env:
+  - name: WECHATAUTO_ACCOUNT
+    description: "微信账号目录名（多账号机需指定；list_accounts 可查看）"
+    prompt: "WeChat account dir (empty = auto-detect)"
+    password: false
+  - name: WECHATAUTO_DB_DIR
+    description: "微信数据根目录（自动探测失败时手动指定 xwechat_files 路径）"
+    prompt: "WeChat data dir (empty = auto-detect)"
+    password: false
+  - name: WECHATAUTO_HOME_CHANNEL
+    description: "cron / 通知的默认投递聊天（昵称或群名）"
+    prompt: "Default delivery chat (nickname or group name)"
+    password: false
+  - name: WECHATAUTO_ALLOWED_USERS
+    description: "私聊白名单（wxid/昵称，逗号分隔；配合 dm_policy=allowlist）"
+    prompt: "Allowed users (comma-separated)"
+    password: false
+  - name: WECHATAUTO_GROUP_ALLOW_FROM
+    description: "群聊白名单（群聊 username 或群名，逗号分隔）"
+    prompt: "Allowed groups (comma-separated)"
+    password: false
+  - name: WECHATAUTO_DM_POLICY
+    description: "私聊准入策略：pairing（默认）/ allowlist / open / disabled"
+    prompt: "DM policy (pairing/allowlist/open/disabled)"
+    password: false
+  - name: WECHATAUTO_GROUP_POLICY
+    description: "群聊准入策略：allowlist（默认）/ open / disabled"
+    prompt: "Group policy (allowlist/open/disabled)"
+    password: false
+  - name: WECHATAUTO_GROUP_REQUIRE_MENTION
+    description: "群聊仅在 @机器人 时触发（默认 true）"
+    prompt: "Groups require @mention? (true/false)"
+    password: false
+  - name: WECHATAUTO_DOWNLOAD_MEDIA
+    description: "解密下载图片/语音/文件到本地供 agent 读取（默认 false）"
+    prompt: "Download inbound media? (true/false)"
+    password: false
+  - name: WECHATAUTO_ALLOW_ALL_USERS
+    description: "开放所有私聊（需要 dm_policy=open；危险，仅自用）"
+    prompt: "Allow all DM users? (true/false)"
+    password: false

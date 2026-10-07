@@ -1,0 +1,60 @@
+{
+  "id": "wechatauto",
+  "kind": "channel",
+  "channels": ["wechatauto"],
+  "name": "WeChat Local",
+  "description": "Personal WeChat 4.x channel driven by the local Windows client through the wechatauto-channels bridge (wechatauto-replica). Complements the official openclaw-weixin channel: supports group chats and needs no Tencent-side bot approval, but requires Windows with WeChat logged in.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "wechatauto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean", "default": false },
+          "bridgeUrl": {
+            "type": "string",
+            "default": "http://127.0.0.1:18765",
+            "description": "wechatauto-channels bridge base URL (python -m wechatauto_channels.bridge)"
+          },
+          "bridgeToken": {
+            "type": "string",
+            "description": "Bearer token printed by the bridge on startup"
+          },
+          "allowFrom": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "DM allowlist: wxid or display names. Empty = policy decides."
+          },
+          "dmSecurity": {
+            "type": "string",
+            "enum": ["pairing", "allowlist", "open", "disabled"],
+            "default": "pairing"
+          },
+          "groupPolicy": {
+            "type": "string",
+            "enum": ["allowlist", "open", "disabled"],
+            "default": "allowlist"
+          },
+          "groupAllowFrom": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Allowed group chats: chatroom usernames or group names."
+          },
+          "requireMention": {
+            "type": "boolean",
+            "default": true,
+            "description": "In groups, only dispatch messages that @ the bot account."
+          },
+          "pollTimeoutMs": {
+            "type": "integer",
+            "default": 30000,
+            "minimum": 1000,
+            "maximum": 55000
+          }
+        }
+      }
+    }
+  }
+}

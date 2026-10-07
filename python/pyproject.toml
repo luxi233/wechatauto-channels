@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wechatauto-channels"
+version = "0.1.0"
+description = "Shared core + local bridge that turns wechatauto-replica into a messaging channel for agent gateways (Hermes / OpenClaw)"
+requires-python = ">=3.9"
+dependencies = [
+    "wechatauto-replica>=1.2.4.4",
+]
+
+[project.optional-dependencies]
+# OCR 发送兜底路径需要
+send-ocr = ["winsdk", "pypinyin"]
+
+[project.scripts]
+wechatauto-bridge = "wechatauto_channels.bridge:main"
+
+[tool.setuptools.packages.find]
+include = ["wechatauto_channels*"]

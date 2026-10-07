@@ -1,0 +1,26 @@
+{
+  "name": "openclaw-wechatauto",
+  "version": "0.1.0",
+  "description": "OpenClaw channel plugin for personal WeChat via wechatauto-replica (local Windows client, DB-decrypt read + UIA/OCR send). Supports DMs and group chats.",
+  "type": "module",
+  "peerDependencies": {
+    "openclaw": ">=2026.3.22"
+  },
+  "openclaw": {
+    "extensions": ["./index.ts"],
+    "setupEntry": "./setup-entry.ts",
+    "channel": {
+      "id": "wechatauto",
+      "label": "WeChat Local",
+      "blurb": "Local WeChat 4.x client via wechatauto-channels bridge — DMs and groups."
+    }
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "vitest": "^3.0.0"
+  }
+}
