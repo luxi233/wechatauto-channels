@@ -18,16 +18,130 @@ OpenClaw 侧通过 ``GET /events?cursor=N&timeout_ms=30000`` 长轮询入站消�
 from __future__ import annotations
 
 import argparse
+import atexit
+import faulthandler
 import json
 import logging
+import os
 import secrets
+import sys
+import tempfile
 import threading
+import time
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 from .core import ChannelCore, EventBuffer, split_text, DEFAULT_MAX_TEXT
 
 logger = logging.getLogger(__name__)
+
+# ── 单实例锁 ────────────────────────────────────────────────────────────────
+# 两个 bridge 同账号共用解密缓存 = wechatbot-new v2.2.5 的 WAL 缓存损坏类事故。
+# Windows 用 msvcrt.byte-lock，POSIX 用 fcntl.flock；都不可用时降级放行并告警。
+_INSTANCE_LOCK = None
+
+
+def _acquire_instance_lock() -> None:
+    global _INSTANCE_LOCK
+    if _INSTANCE_LOCK is not None:
+        return
+    path = os.path.join(tempfile.gettempdir(), "wechatauto-channels-bridge.lock")
+    handle = open(path, "a+b")
+    try:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as e:
+        handle.close()
+        raise RuntimeError(
+            "已有另一个 wechatauto bridge 在运行（同账号共享解密缓存会损坏），"
+            "请先停掉旧实例") from e
+    except ImportError:  # 极端平台两个都没有：放行但告警
+        handle.close()
+        logger.warning("平台无 msvcrt/fcntl —— 单实例锁不可用")
+        return
+    _INSTANCE_LOCK = handle
+    logger.info("single-instance lock acquired: %s", path)
+
+
+def _release_instance_lock() -> None:
+    global _INSTANCE_LOCK
+    handle, _INSTANCE_LOCK = _INSTANCE_LOCK, None
+    if handle is None:
+        return
+    try:
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        handle.close()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# ── 崩溃取证 ────────────────────────────────────────────────────────────────
+# stardome 教训（2026-09-22 两次 code=1 静默死亡，stderr 无 traceback）：
+# faulthandler 抓原生层崩溃（comtypes/UIA 段错误），excepthook 抓未处理异常，
+# atexit 标记正常退出——「无 atexit 记录」本身就是外部击杀的直接证据。
+_CRASH_FP = None
+
+
+def _crash_write(text: str) -> None:
+    for sink in (sys.stderr, _CRASH_FP):
+        try:
+            if sink is not None:
+                sink.write(text)
+                sink.flush()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _install_crash_diagnostics() -> None:
+    global _CRASH_FP
+    log_dir = os.path.join(tempfile.gettempdir(), "wechatauto-channels")
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        _CRASH_FP = open(os.path.join(log_dir, "bridge-fatal.log"),
+                         "a", encoding="utf-8", buffering=1)
+        faulthandler.enable(file=_CRASH_FP)
+    except Exception:  # noqa: BLE001
+        try:
+            faulthandler.enable()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def on_uncaught(exc_type, exc, tb):
+        _crash_write("\n===== BRIDGE FATAL (uncaught) %s =====\n%s\n" % (
+            time.strftime("%F %T"),
+            "".join(traceback.format_exception(exc_type, exc, tb))))
+
+    def on_thread_crash(args):
+        _crash_write("\n===== BRIDGE THREAD CRASH (%s) %s =====\n%s\n" % (
+            getattr(args.thread, "name", "?"), time.strftime("%F %T"),
+            "".join(traceback.format_exception(
+                args.exc_type, args.exc_value, args.exc_traceback))))
+
+    def on_atexit():
+        _crash_write("\n===== BRIDGE EXIT %s =====\n" % time.strftime("%F %T"))
+
+    sys.excepthook = on_uncaught
+    threading.excepthook = on_thread_crash
+    atexit.register(on_atexit)
 
 MAX_LONGPOLL_MS = 55_000
 MAX_BODY_BYTES = 64 * 1024
@@ -154,22 +268,36 @@ def make_handler(state: BridgeState):
     return Handler
 
 
-def serve(host: str, port: int, token: str, core: ChannelCore) -> None:
+def serve_thread(host: str, port: int, token: str,
+                 core: ChannelCore) -> "tuple":
+    """非阻塞启动（测试/嵌入式用）。返回 (thread, httpd)；httpd.shutdown() 停止。"""
+    _install_crash_diagnostics()
+    _acquire_instance_lock()
     state = BridgeState(core, token)
     core.on_event = state.buffer.push
     info = core.start()
     logger.info("bridge up: account=%s wxid=%s nick=%s",
                 info["account"], info["wxid"], info["nickname"])
     httpd = ThreadingHTTPServer((host, port), make_handler(state))
+    t = threading.Thread(target=httpd.serve_forever,
+                         daemon=True, name="wac-bridge-http")
+    t.start()
     logger.info("listening on http://%s:%d (token %s)",
-                host, port, "required" if token else "DISABLED")
+                host, httpd.server_address[1], "required" if token else "DISABLED")
+    return t, httpd
+
+
+def serve(host: str, port: int, token: str, core: ChannelCore) -> None:
+    t, httpd = serve_thread(host, port, token, core)
     try:
-        httpd.serve_forever()
+        t.join()
     except KeyboardInterrupt:
         pass
     finally:
         core.stop()
+        httpd.shutdown()
         httpd.server_close()
+        _release_instance_lock()
 
 
 def main(argv=None) -> int:

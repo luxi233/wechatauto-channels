@@ -95,12 +95,42 @@ openclaw wechatauto status   # 健康检查
 2. 表情/图片 XML 里 `fromusername` == 本机 wxid
 3. `sender_username`（SenderName2Id 反查）== 本机 wxid
 
-整个会话都拿不到正向证据时才退回 `sender_id == 2`。
+整个会话都拿不到正向证据时才退回 `sender_id in {1,2}`
+（stardome 生产实测：4.1.13.x 的出站行用过 `1`，只判 `2` 会漏）。
+
+## 「@机器人」判定（群聊门控）
+
+正文 `@昵称` 可以被粘贴伪造，不是证据。本项目在 `core.start()` 时给
+`WeChatDB._msg_row_to_dict` 打**幂等投影补丁**（上游原生支持则自动跳过），
+把 `source` 列里的 `<atuserlist>` 和 appmsg 里的 `<refermsg>` 投影进消息 dict：
+
+- `at_usernames`（三态）：list=权威（空列表=确定没@人）；`None`=不可判定，
+  两端适配器退回文本 `@昵称` 兜底
+- `quoted`：引用回复里 `sender==本机 wxid` **视同被@**；顺带修复上游把
+  引用消息显示成「文件/链接/卡片」走 file 路由、正文被吞的问题
+  （stardome 审计 D4+D5），`type` 归一化为 `quote`，正文还原 `<title>` 文本
+
+## 其他实现要点
+
+- **消息类型**：上游 `MSG_TYPE_NAMES` 是中文显示名（`文本`/`图片`/`文件/链接/卡片`…），
+  `core.py::_canon_type` 统一归一成英文 tag（`text`/`image`/`file`…），
+  两个宿主的下游 mapping 只用认英文。
+- **事件去重键**：`{chat}:{sort_seq}`——`local_id` 跨分片会重复，`sort_seq`
+  才是单调水印。
+- **群聊发言人**：`sender_username` 缺失/纯数字时，从 content 前缀
+  `wxid_…:` 恢复真实发言人 wxid（stardome 实测 sender_id 落过 `3`）。
+- **发送节流**：上游 ≥1.2.3 自带拟人节奏层（默认 `natural` 会把 agent 的
+  分段回复卡出 2.5–6s 间隔）；本包默认 `WECHATAUTO_RHYTHM=off`
+  （env 可覆盖回 natural/calm）。
+- **bridge 加固**：单实例锁（`%TEMP%\wechatauto-channels-bridge.lock`，
+  防止两个 bridge 共享解密缓存）+ 崩溃取证（faulthandler/excepthook/atexit
+  → `%TEMP%\wechatauto-channels\bridge-fatal.log`）。
 
 ## 测试
 
 ```bash
-cd python && python -m unittest tests.test_core -v        # 14 项，无需微信
+cd python && python -m unittest discover -s tests -v    # 34 项，无需微信
+#    含 test_bridge_e2e.py：stub wechatauto → 真 HTTP 端到端
 cd openclaw/openclaw-wechatauto && npm test             # 8 项契约测试
 ```
 

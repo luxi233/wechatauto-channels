@@ -221,6 +221,7 @@ export const wechatautoPlugin: ChannelPlugin<ResolvedWeChatLocalAccount> = {
           groupAllowFrom: account.groupAllowFrom,
           requireMention: account.requireMention,
           selfNick: health.nickname,
+          selfWxid: health.wxid,
         },
         pollTimeoutMs: account.pollTimeoutMs,
       });

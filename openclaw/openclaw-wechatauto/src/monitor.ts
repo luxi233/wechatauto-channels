@@ -29,6 +29,7 @@ export type MonitorDeps = {
     groupAllowFrom: string[];
     requireMention: boolean;
     selfNick: string;
+    selfWxid: string;
   };
   pollTimeoutMs: number;
 };
@@ -98,14 +99,23 @@ async function processOneEvent(ev: BridgeEvent, deps: MonitorDeps): Promise<void
     }
   }
 
-  // 群聊 @机器人 门控
+  // 群聊 @机器人 门控：atuserlist XML 是权威证据（文本 @昵称 可伪造）；
+  // 引用我的消息视同@（stardome 生产语义）；都缺席时退回文本兜底。
   let body = ev.text;
   let mentioned = false;
   if (isGroup && policy.requireMention) {
-    const stripped = stripMention(body, policy.selfNick);
-    if (!stripped.mentioned) return;
-    mentioned = true;
-    body = stripped.body;
+    const quotedSelf =
+      ev.quoted?.sender != null && ev.quoted.sender === policy.selfWxid;
+    if (Array.isArray(ev.at_usernames)) {
+      mentioned = quotedSelf || ev.at_usernames.includes(policy.selfWxid);
+    } else {
+      const stripped = stripMention(body, policy.selfNick);
+      mentioned = quotedSelf || stripped.mentioned;
+      body = stripped.body;
+    }
+    if (!mentioned) return;
+    // 命中后仍要剥掉正文里的 @昵称 残留（atuserlist 命中时正文也带 @片段）
+    body = stripMention(body, policy.selfNick).body || body;
   }
   if (!body.trim()) return;
 

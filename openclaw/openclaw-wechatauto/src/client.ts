@@ -20,6 +20,10 @@ export type BridgeEvent = {
   local_id: number;
   sort_seq: number;
   media_path?: string | null;
+  /** 权威@证据：list=确定（空=没@人）；null/缺席=不可判定，走文本兜底 */
+  at_usernames?: string[] | null;
+  /** 引用消息：sender=被引人 wxid；等于本机 wxid 时视同被@ */
+  quoted?: { sender?: string; sender_name?: string; text?: string } | null;
 };
 
 export type BridgeEventsResponse = {

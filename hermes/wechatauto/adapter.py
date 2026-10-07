@@ -365,13 +365,22 @@ class WeChatLocalAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         mentioned = False
         if ev.chat_type == "group" and self.group_require_mention:
             nick = (self._core.self_nick if self._core else "") or ""
-            # 命中 @我 才放行；命中后把 @片段从正文剥掉
+            wxid = (self._core.self_wxid if self._core else "") or ""
+            # at_usernames（list）是权威证据：空=确定没@；None=不可判定走文本兜底
+            quoted_self = bool(
+                wxid and getattr(ev, "quoted", None)
+                and ev.quoted.get("sender") == wxid)  # 引用我视同@
+            if isinstance(getattr(ev, "at_usernames", None), list):
+                mentioned = quoted_self or (bool(wxid)
+                                            and wxid in ev.at_usernames)
+            else:
+                mentioned = quoted_self or bool(nick and f"@{nick}" in text)
+            if not mentioned:
+                return  # 群里没点名的消息不进队列（旁听/摘要是后续扩展）
+            # 命中后把 @片段从正文剥掉（atuserlist 命中时正文也可能带残留）
             if nick and f"@{nick}" in text:
-                mentioned = True
                 text = re.sub(rf"@{re.escape(nick)}{_MENTION_TAIL_RE}",
                               "", text).strip()
-            else:
-                return  # 群里没点名的消息不进队列（旁听/摘要是后续扩展）
         if not text.strip():
             return
         source = self.build_source(
