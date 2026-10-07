@@ -378,7 +378,10 @@ class ChannelCore:
         from wechatauto.guia import quick_send
 
         resp = quick_send(text, username, verify=verify)
-        ok = str(resp.get("status", "")).lower() == "success"
+        # WxResponse.status 是中文（成功/失败/错误），兼容英文取值。
+        # Note: 误判会导致 Hermes 侧兜底重发 — 见
+        # .agents/notes/implemented/bug-fix/2026-10-07-hermes-v0.21-compat.md
+        ok = str(resp.get("status", "")) in ("成功", "success")
         return {"ok": ok, "message": resp.get("message"), "to": username}
 
     def send_file(self, target: str, path: str, image: bool = False,
@@ -389,7 +392,8 @@ class ChannelCore:
         from wechatauto.guia import quick_send_file, quick_send_image
 
         resp = (quick_send_image if image else quick_send_file)(path, username, verify=verify)
-        ok = str(resp.get("status", "")).lower() == "success"
+        # WxResponse.status 是中文（成功/失败/错误），兼容英文取值
+        ok = str(resp.get("status", "")) in ("成功", "success")
         return {"ok": ok, "message": resp.get("message"), "to": username}
 
     # ------------------------------------------------------------------

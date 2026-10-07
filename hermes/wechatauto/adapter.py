@@ -31,17 +31,48 @@ import threading
 from typing import Any, Dict, Iterable, List, Optional
 
 from gateway.config import Platform
-from gateway.platforms._shared import (
-    extra_or_secret,
-    seed_extra_from_env as _seed_extra_from_env,
-    apply_yaml_bridge,
-    send_error,
-)
-from gateway.platforms.access_policy_mixin import OwnAccessPolicyMixin
 from gateway.platforms.base import BasePlatformAdapter, SendResult
-from gateway.platforms.event import MessageEvent, MessageType
+
+try:
+    from gateway.platforms._shared import (
+        extra_or_secret,
+        seed_extra_from_env as _seed_extra_from_env,
+        apply_yaml_bridge,
+        send_error,
+    )
+except ImportError:  # 旧版 hermes（如 0.21.0）_shared 无这些 helper → 用插件内 vendor
+    from ._compat_shared import (
+        extra_or_secret,
+        seed_extra_from_env as _seed_extra_from_env,
+        apply_yaml_bridge,
+        send_error,
+    )
+try:
+    from gateway.platforms.access_policy_mixin import OwnAccessPolicyMixin
+except ImportError:  # 旧版 hermes 无此 mixin → 用插件内 vendor
+    from ._compat_policy import OwnAccessPolicyMixin
+try:
+    from gateway.platforms.event import MessageEvent, MessageType
+except ImportError:  # 旧版 hermes（如 0.21.0）事件类在 platforms.base
+    from gateway.platforms.base import MessageEvent, MessageType
 
 logger = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def _preserve_root_logging():
+    """wechatauto 的 wxlog 在**首次 import** 时会清空 root handlers、
+    把日志全转去 stderr——在 gateway 进程内会把 Hermes 的 QueueHandler
+    管线连根拔掉（三个 log 文件从此静默）。快照并在导入后还原。
+    Note: 与中文 status 误判、插件兼容层的完整 RCA —
+    见 .agents/notes/implemented/bug-fix/2026-10-07-hermes-v0.21-compat.md"""
+    root = logging.getLogger()
+    saved_handlers, saved_level = root.handlers[:], root.level
+    try:
+        yield
+    finally:
+        root.handlers[:] = saved_handlers
+        root.setLevel(saved_level)
 
 PLATFORM = "wechatauto"
 ENV_PREFIX = "WECHATAUTO"
@@ -177,7 +208,8 @@ class WeChatLocalAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
     # 生命周期
     # ------------------------------------------------------------------
     def _make_core(self):
-        from wechatauto_channels.core import ChannelCore  # 懒导入：含 Windows-only 依赖
+        with _preserve_root_logging():
+            from wechatauto_channels.core import ChannelCore  # 懒导入：含 Windows-only 依赖
 
         return ChannelCore(
             account=self.account, db_dir=self.db_dir,
@@ -391,8 +423,9 @@ class WeChatLocalAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             text=text, message_type=_msg_type(ev.type), source=source,
             message_id=ev.id, raw_message=ev.to_dict(),
             timestamp=(datetime.datetime.fromtimestamp(ev.timestamp)
-                       if ev.timestamp else datetime.datetime.now()),
-            reply_expected=(True if ev.chat_type == "dm" else mentioned or None))
+                       if ev.timestamp else datetime.datetime.now()))
+        # reply_expected 是新版字段（旧版 MessageEvent 无此 kwarg）：setattr 兼容两版
+        event.reply_expected = True if ev.chat_type == "dm" else mentioned or None
         if ev.media_path:
             event.media_urls = [ev.media_path]
             event.media_types = [_media_mime(ev.type)]
@@ -474,8 +507,9 @@ async def _standalone_send(pconfig, chat_id: str, message: str, *,
         return send_error("wechatauto_channels / wechatauto not installed")
     extra = getattr(pconfig, "extra", {}) or {}
     try:
-        from wechatauto.db import WeChatDB
-        from wechatauto_channels.core import ChannelCore, split_text
+        with _preserve_root_logging():
+            from wechatauto.db import WeChatDB
+            from wechatauto_channels.core import ChannelCore, split_text
 
         core = ChannelCore(account=str(_env(extra, "account", "") or "") or None,
                            db_dir=str(_env(extra, "db_dir", "") or "") or None)

@@ -17,7 +17,7 @@
 └──────────┬───────────────┘   └──────────────┬───────────────────┘
            │                                  │ HTTP (127.0.0.1:18765)
            │                    ┌─────────────▼───────────────────┐
-           │                    │ python -m wechatauto_channels.bridge │
+           │                    │ python -m wechatauto_channels        │
            └───────────────────►│  /events 长轮询 · /send · /send_file │
                                └─────────────┬───────────────────┘
                                              │ wechatauto-replica
@@ -67,7 +67,7 @@ hermes gateway restart
 
 ```bash
 # 1) 在微信所在的 Windows 机器上启动桥
-python -m wechatauto_channels.bridge --port 18765
+python -m wechatauto_channels --port 18765
 #    控制台会打印一次性 token，复制它
 
 # 2) 安装插件（本地目录或打包后 npm 包）
@@ -135,7 +135,7 @@ cd openclaw/openclaw-wechatauto && npm test             # 8 项契约测试
 ```
 
 真实收发验证必须在一台登录微信的 Windows 机器上跑：
-`python -m wechatauto_channels.bridge` 起来后 `curl http://127.0.0.1:18765/health`。
+`python -m wechatauto_channels` 起来后 `curl http://127.0.0.1:18765/health`。
 
 ## 风险与边界
 
