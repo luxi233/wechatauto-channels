@@ -72,14 +72,22 @@ class _FakeWeChatDB:
         return []
 
 
-def _fake_quick_send(text, who, verify=False):
-    _sent.append(("text", who, text))
-    return {"status": "success", "message": "ok"}
+class _FakeGUI:
+    """core 现在持有共享 WeChatGUI 实例走 send_msg/send_file，
+    不再是模块级 quick_send——stub 类形态保持一致。"""
 
+    def __init__(self):
+        self._last_input_box = None
 
-def _fake_quick_send_file(path, who, verify=False):
-    _sent.append(("file", who, path))
-    return {"status": "success", "message": "ok"}
+    def send_msg(self, text, who=None, verify=False):
+        _sent.append(("text", who, text))
+        return {"status": "success", "message": "ok"}
+
+    def send_file(self, path, who=None, verify=False):
+        _sent.append(("file", who, path))
+        return {"status": "success", "message": "ok"}
+
+    send_image = send_file
 
 
 def _install_wechatauto_stub():
@@ -88,9 +96,7 @@ def _install_wechatauto_stub():
     db_mod.Listener = _FakeListener
     db_mod.WeChatDB = _FakeWeChatDB
     guia_mod = types.ModuleType("wechatauto.guia")
-    guia_mod.quick_send = _fake_quick_send
-    guia_mod.quick_send_file = _fake_quick_send_file
-    guia_mod.quick_send_image = _fake_quick_send_file
+    guia_mod.WeChatGUI = _FakeGUI
     media_mod = types.ModuleType("wechatauto.media")
     pkg.db = db_mod
     pkg.guia = guia_mod
@@ -176,13 +182,16 @@ class TestBridgeE2E(unittest.TestCase):
                            f"/events?cursor={body['cursor']}&timeout_ms=500")
         self.assertEqual(body2["events"], [])
 
-    # ── 出站：resolve → quick_send ──────────────────────────────────────
+    # ── 出站：resolve → 显示名 → gui.send_msg ─────────────────────────
     def test_04_send_text(self):
         code, body = _req(self.port, "POST", "/send",
                           {"to": "好友甲", "text": "回执测试"})
         self.assertEqual(code, 200)
         self.assertTrue(body["ok"])
-        self.assertIn(("text", "wxid_friend", "回执测试"), _sent)
+        # GUI 层收到的是显示名（搜索框不认 wxid/@chatroom id），
+        # 回包 results 里的 to 仍是会话 username
+        self.assertIn(("text", "好友甲", "回执测试"), _sent)
+        self.assertEqual(body["results"][0].get("to"), "wxid_friend")
 
     def test_05_send_unresolvable(self):
         code, body = _req(self.port, "POST", "/send",

@@ -267,6 +267,14 @@ class ChannelCore:
         self._self_lock = threading.Lock()
         self._name_cache: Dict[str, str] = {}
         self._name_lock = threading.Lock()
+        # 真实微信窗口只有一个：并发发送会共享搜索框/输入框互相拣结果
+        # （实测：群回复与私聊回复撞上时一起落进私聊）。进程内串行兜底。
+        # 注意锁是每进程一把：gateway in-process 插件与 bridge sidecar
+        # 若同时运行仍会竞争窗口——同一时刻只应有一个宿主在写。
+        # Note: 串话/群聊发不出 RCA 与取舍 — 见
+        # .agents/notes/implemented/bug-fix/2026-10-07-send-race-displayname.md
+        self._send_lock = threading.Lock()
+        self._wx_gui = None
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -371,17 +379,89 @@ class ChannelCore:
     # ------------------------------------------------------------------
     # 写侧（GUI 驱动，调用方负责放到线程池）
     # ------------------------------------------------------------------
+    def _gui(self):
+        """惰性共享 WeChatGUI。
+
+        ``quick_send`` 每次调用新建实例——``_current_chat`` 会话复用、
+        ``_cached_db`` 密钥缓存、UIA 驱动全部冷启动，逐条发送每次都要
+        重走 open_chat/搜索框定位的主要耗时就是这么来的。
+        """
+        if self._wx_gui is None:
+            from wechatauto.guia import WeChatGUI
+            self._wx_gui = WeChatGUI()
+        return self._wx_gui
+
+    def _who_name(self, username: str) -> str:
+        """GUI 发送目标转成显示名。
+
+        微信搜索框只认昵称/备注/微信号/群名，不认 wxid/@chatroom id
+        （replica 的 ``_resolve_search_keyword`` 只查 search_contact，
+        群聊在其中没有记录）。传 id 必搜不到、还会在搜索框/侧栏空转到
+        超时；``uia.current_chat()`` 返回的也是显示名，传名后
+        ``current_chat() == who`` 的免搜索复用路径才真正生效。
+        查不到显示名时 ``_display_name`` 原样回落 username。
+        """
+        if username.startswith(("wxid_", "gh_")) \
+                or username.endswith("@chatroom") \
+                or username == "filehelper":
+            return self._display_name(username)
+        return username
+
+    def _send_mark(self, username: str) -> int:
+        """发送前落库水位（sort_seq 上限）；verify 只认不比它旧的行。"""
+        try:
+            rows = self.db.get_messages(username, limit=8) or []
+            return max((int(r.get("sort_seq") or 0) for r in rows), default=0)
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def _verify_sent(self, username: str, text: Optional[str], mark: int,
+                     timeout: float = 10.0) -> bool:
+        """用 ChannelCore 已开的 db 按会话 username 回读确认。
+
+        replica 自带的 verify 另建 WeChatDB（重复密钥扫描）且按显示名
+        反解 username——群聊在 search_contact 里查不到，口径对不上。
+        这里直接拿消息表 username 校验：打进错误会话的消息在本会话表里
+        查不到，顺带覆盖串话漏检。text=None 用于附件：只认水位后有自己
+        发出的新行（附件行正文是 XML，不做逐字比对）。
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                rows = self.db.get_messages(username, limit=10) or []
+            except Exception:  # noqa: BLE001
+                rows = []
+            for m in rows:
+                if int(m.get("sort_seq") or 0) < mark:
+                    continue
+                if not self._is_self(username, m):
+                    continue
+                if text is None or str(m.get("content") or "") == text:
+                    return True
+            time.sleep(1.0)
+        return False
+
     def send_text(self, target: str, text: str, verify: bool = False) -> Dict[str, Any]:
         username = self.resolve_target(target)
         if not username:
             return {"ok": False, "error": f"无法解析发送对象: {target!r}"}
-        from wechatauto.guia import quick_send
-
-        resp = quick_send(text, username, verify=verify)
+        mark = self._send_mark(username) if verify else 0
+        gui = self._gui()
+        # send_msg 的盲复用快路径（who==_current_chat 时直接往 _last_input_box
+        # 输入）不校验真实前台会话——用户手动切窗后旧输入框元素会把消息打进
+        # 别的会话。置空后走 current_chat()/标题 OCR 校验过的路径，照样复用。
+        gui._last_input_box = None
+        with self._send_lock:
+            resp = gui.send_msg(text, self._who_name(username), verify=False)
         # WxResponse.status 是中文（成功/失败/错误），兼容英文取值。
         # Note: 误判会导致 Hermes 侧兜底重发 — 见
         # .agents/notes/implemented/bug-fix/2026-10-07-hermes-v0.21-compat.md
         ok = str(resp.get("status", "")) in ("成功", "success")
+        if ok and verify:
+            ok = self._verify_sent(username, text, mark)
+            return {"ok": ok,
+                    "message": "已发送并确认" if ok else "已发送但数据库未确认",
+                    "to": username}
         return {"ok": ok, "message": resp.get("message"), "to": username}
 
     def send_file(self, target: str, path: str, image: bool = False,
@@ -389,11 +469,18 @@ class ChannelCore:
         username = self.resolve_target(target)
         if not username:
             return {"ok": False, "error": f"无法解析发送对象: {target!r}"}
-        from wechatauto.guia import quick_send_file, quick_send_image
-
-        resp = (quick_send_image if image else quick_send_file)(path, username, verify=verify)
+        mark = self._send_mark(username) if verify else 0
+        gui = self._gui()
+        with self._send_lock:
+            resp = (gui.send_image if image else gui.send_file)(
+                path, self._who_name(username), verify=False)
         # WxResponse.status 是中文（成功/失败/错误），兼容英文取值
         ok = str(resp.get("status", "")) in ("成功", "success")
+        if ok and verify:
+            ok = self._verify_sent(username, None, mark)
+            return {"ok": ok,
+                    "message": "已发送并确认" if ok else "已发送但数据库未确认",
+                    "to": username}
         return {"ok": ok, "message": resp.get("message"), "to": username}
 
     # ------------------------------------------------------------------
