@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wechatauto-channels"
-version = "0.1.3"
+version = "0.1.4"
 description = "Shared core + local bridge that turns wechatauto-replica into a messaging channel for agent gateways (Hermes / OpenClaw)"
 requires-python = ">=3.9"
 dependencies = [
@@ -17,6 +17,7 @@ send-ocr = ["winsdk", "pypinyin"]
 
 [project.scripts]
 wechatauto-bridge = "wechatauto_channels.bridge:main"
+wechatauto-manager = "wechatauto_channels.manager:main"
 
 [tool.setuptools.packages.find]
 include = ["wechatauto_channels*"]
