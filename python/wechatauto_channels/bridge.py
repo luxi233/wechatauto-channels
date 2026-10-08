@@ -30,6 +30,7 @@ import tempfile
 import threading
 import time
 import traceback
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -163,6 +164,9 @@ class BridgeState:
         self.token = token
         self.buffer = EventBuffer()
         self._send_lock = threading.Lock()  # GUI 发送全局串行，避免并发抢输入框
+        # 进程级启动标识：消费方（Octop adapter 等）用它区分"桥重启了
+        # （seq 归零、队列只含新事件）"和"adapter 自己重启了（应续游标）"。
+        self.boot_id = uuid.uuid4().hex
 
 
 def make_handler(state: BridgeState):
@@ -209,6 +213,7 @@ def make_handler(state: BridgeState):
                     "ok": True, "wxid": state.core.self_wxid,
                     "nickname": state.core.self_nick,
                     "media": bool(state.core._media),
+                    "boot_id": state.boot_id,
                 })
             if path == "/chats":
                 return _json_response(self, 200,
