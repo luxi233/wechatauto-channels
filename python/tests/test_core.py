@@ -39,6 +39,9 @@ class FakeConn:
         assert f'FROM "{self._table}"' in sql
         return FakeCursor([(sid, st) for sid, st in self._rows])
 
+    def close(self):
+        pass
+
 
 class FakeDB:
     """ChannelCore 用到的最小 DB 面。"""

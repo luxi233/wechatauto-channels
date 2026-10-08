@@ -294,6 +294,11 @@ class ChannelCore:
         """初始化 DB（首次密钥扫描 ~6s，阻塞）并启动全局监听。返回自检信息。"""
         from wechatauto.db import Listener, WeChatDB  # 懒导入：Windows-only
 
+        # 先打 replica 已知缺陷补丁再实例化——补丁是进程内 monkeypatch，
+        # 必须在 WeChatDB/Listener 创建前生效（上游已修则自动跳过）。
+        from .replica_compat import apply_replica_patches
+
+        apply_replica_patches()
         _install_row_projection(WeChatDB)
         self.db = WeChatDB(db_dir=self._db_dir, account=self._account)
         info = self.db.get_self_info() or {}
@@ -312,19 +317,25 @@ class ChannelCore:
                 self._media = None
 
         # add_all + discover：跟随新出现的会话；回调在每会话一条的串行工作线程里跑
+        # PermissionError 单独放宽预算——Windows 上 os.replace 会被瞬时文件占用
+        # （杀软实时扫描新写出的解密库）打挂，1.5s 间隔的 5 次不够跨扫描窗口。
         last_exc: Optional[Exception] = None
-        for attempt in range(5):
+        attempts = 0
+        deadline = time.time() + 90
+        while attempts < 40 and time.time() < deadline:
+            attempts += 1
             listener = Listener(self.db, interval=self._poll_interval)
             try:
                 listener.add_all(self._on_raw_message, discover=True)
                 listener.start()
                 self._listener = listener
-                logger.info("listener started (attempt=%d)", attempt + 1)
+                logger.info("listener started (attempt=%d)", attempts)
                 break
             except Exception as e:  # noqa: BLE001
                 last_exc = e
-                logger.warning("listener registration failed (attempt %d/5): %r",
-                               attempt + 1, e)
+                is_perm = isinstance(e, PermissionError)
+                logger.warning("listener registration failed (attempt %d): %r",
+                               attempts, e)
                 try:
                     listener.stop()
                 except Exception:  # noqa: BLE001
@@ -334,10 +345,11 @@ class ChannelCore:
                         self.db._invalidate_cache()
                 except Exception:  # noqa: BLE001
                     pass
-                time.sleep(1.5)
+                time.sleep(4.0 if is_perm else 1.5)
         else:
             raise RuntimeError(
-                f"listener registration failed after 5 attempts: {last_exc!r}")
+                f"listener registration failed after {attempts} attempts: "
+                f"{last_exc!r}")
         return {"wxid": self.self_wxid, "nickname": self.self_nick,
                 "account": self.db.account, "media": bool(self._media)}
 
@@ -709,21 +721,30 @@ class ChannelCore:
         except Exception as e:  # noqa: BLE001
             logger.debug("status votes 读取失败 chat=%s: %s", chat, e)
             conns = None
-        for conn, table in conns or []:
-            if not _MSG_TABLE_RE.match(str(table)):
-                continue
-            try:
-                rows = conn.execute(
-                    'SELECT real_sender_id, status FROM "%s" '
-                    "ORDER BY sort_seq DESC LIMIT 200" % table
-                ).fetchall()
-            except Exception:  # noqa: BLE001
-                continue
-            for sid, st in rows:
-                v = votes.setdefault(str(sid), [0, 0])
-                v[0] += 1
-                if st == 2:
-                    v[1] += 1
+        try:
+            for conn, table in conns or []:
+                if not _MSG_TABLE_RE.match(str(table)):
+                    continue
+                try:
+                    rows = conn.execute(
+                        'SELECT real_sender_id, status FROM "%s" '
+                        "ORDER BY sort_seq DESC LIMIT 200" % table
+                    ).fetchall()
+                except Exception:  # noqa: BLE001
+                    continue
+                for sid, st in rows:
+                    v = votes.setdefault(str(sid), [0, 0])
+                    v[0] += 1
+                    if st == 2:
+                        v[1] += 1
+        finally:
+            # _msg_conns 的连接所有权在调用方，必须显式关闭：
+            # 泄漏的句柄会在下次快照重建时挡住 os.replace（Windows）。
+            closed = set()
+            for conn, _ in conns or []:
+                if id(conn) not in closed:
+                    closed.add(id(conn))
+                    conn.close()
         self_ids = {sid for sid, (n, c) in votes.items()
                     if c >= max(1, int(0.3 * n))}
         result = (self_ids, bool(votes))
