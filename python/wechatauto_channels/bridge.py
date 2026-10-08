@@ -219,6 +219,23 @@ def make_handler(state: BridgeState):
                 handle = (q.get("handle") or [""])[0]
                 return _json_response(self, 200,
                                       {"username": state.core.resolve_target(handle)})
+            if path == "/context":
+                # listen/旁听出口：任何群的近期上文查询（含未准入群——
+                # 持 token 即授权，bridge 不复用 adapter 策略表）。
+                chat = (q.get("chat") or [""])[0].strip()
+                if not chat:
+                    return _json_response(self, 400,
+                                          {"ok": False,
+                                           "error": "missing 'chat'"})
+                try:
+                    n = max(1, min(int((q.get("n") or ["8"])[0]), 50))
+                except ValueError:
+                    return _json_response(self, 400,
+                                          {"ok": False, "error": "bad 'n'"})
+                target = state.core.resolve_target(chat) or chat
+                return _json_response(
+                    self, 200,
+                    state.core.recent_context(target, limit=n))
             if path == "/events":
                 try:
                     cursor = int((q.get("cursor") or ["0"])[0])

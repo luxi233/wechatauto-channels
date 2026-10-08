@@ -41,6 +41,9 @@ optional_env:
   - name: WECHATAUTO_GROUP_REQUIRE_MENTION
     description: "群聊仅在 @机器人 时触发（默认 true）"
     prompt: "Groups require @mention? (true/false)"
+  - name: WECHATAUTO_CHAT_POLICY
+    description: "每群模式表 JSON 路径（at/reply/listen，mtime 热加载；默认无）"
+    prompt: "Per-chat policy JSON path (empty = none)"
     password: false
   - name: WECHATAUTO_DOWNLOAD_MEDIA
     description: "解密下载图片/语音/文件到本地供 agent 读取（默认 false）"

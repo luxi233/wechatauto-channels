@@ -101,6 +101,8 @@ _YAML_SPEC = (
     ("media_dir", f"{ENV_PREFIX}_MEDIA_DIR", "str"),
     ("send_verify", f"{ENV_PREFIX}_SEND_VERIFY", "lower"),
     ("group_require_mention", f"{ENV_PREFIX}_GROUP_REQUIRE_MENTION", "lower"),
+    ("group_context", f"{ENV_PREFIX}_GROUP_CONTEXT", "str"),
+    ("chat_policy", f"{ENV_PREFIX}_CHAT_POLICY", "str"),
     ("dm_policy", f"{ENV_PREFIX}_DM_POLICY", "lower"),
     ("group_policy", f"{ENV_PREFIX}_GROUP_POLICY", "lower"),
     ("allow_from", f"{ENV_PREFIX}_ALLOWED_USERS", "csv"),
@@ -125,6 +127,19 @@ def _csv(value: Any) -> List[str]:
     if isinstance(value, (list, tuple)):
         return [str(v).strip() for v in value if str(v).strip()]
     return [p.strip() for p in str(value or "").split(",") if p.strip()]
+
+
+def _load_chat_policy(path: str):
+    """每群模式表（懒导入：wechatauto_channels 依赖链在非 Windows
+    插件扫描环境可能不可用；失败时回落全局开关语义，不阻断启动）。"""
+    if not path.strip():
+        return None
+    try:
+        from wechatauto_channels.chat_policy import load_policy
+        return load_policy(path)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("wechatauto: chat_policy 加载失败，忽略（%r）", exc)
+        return None
 
 
 def _strip_markdown(text: str) -> str:
@@ -171,6 +186,18 @@ class WeChatLocalAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         self.send_verify = _truthy(_env(extra, "send_verify"), False)
         self.group_require_mention = _truthy(
             _env(extra, "group_require_mention"), True)
+        # @触发时拼进正文的近期群聊上文条数（0=关闭）。
+        # 图片/文件消息没法带 @ —— 用户常先发媒体再补文字 @，
+        # 只派发 @ 消息会把前文媒体整条丢掉。
+        try:
+            self.group_context_messages = max(
+                0, int(_env(extra, "group_context", 8) or 8))
+        except (TypeError, ValueError):
+            self.group_context_messages = 8
+        # 每群模式表（at/reply/listen）：未配置时等价于只有
+        # group_require_mention 全局开关。见 chat_policy.py。
+        self._chat_policy = _load_chat_policy(
+            str(_env(extra, "chat_policy", "") or ""))
 
         # OwnAccessPolicyMixin 契约字段
         self._dm_policy = str(_env(extra, "dm_policy", "pairing") or "pairing")
@@ -381,6 +408,19 @@ class WeChatLocalAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                 self._seen = set(list(self._seen)[-2500:])
         asyncio.run_coroutine_threadsafe(self._dispatch(ev), self._loop)
 
+    def _group_mode(self, ev) -> str:
+        """该群有效触发模式。DM 恒为 ``reply``（不占模式表）。"""
+        if ev.chat_type != "group":
+            return "reply"
+        default = "at" if self.group_require_mention else "reply"
+        if self._chat_policy is None:
+            return default
+        try:
+            return self._chat_policy.mode_for(
+                ev.chat_id, getattr(ev, "chat_name", "") or "", default)
+        except Exception:  # noqa: BLE001
+            return default  # 策略表异常永不改变既有行为
+
     async def _dispatch(self, ev) -> None:
         if ev.is_self:
             return  # 本机发的消息不回环给 agent
@@ -393,9 +433,17 @@ class WeChatLocalAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             logger.debug("wechatauto: group %s denied by policy=%s",
                          ev.chat_id, self._group_policy)
             return
+        # 每群触发模式：at（@才回）/ reply（全回）/ listen（永不回，
+        # 历史留在 WeChatDB 供 /context 或 recent CLI 查询）。
+        # 无策略文件时 mode 由全局 group_require_mention 决定——
+        # 行为与旧版完全一致。
+        mode = self._group_mode(ev)
+        if mode == "listen":
+            return
         text = ev.text
         mentioned = False
-        if ev.chat_type == "group" and self.group_require_mention:
+        ctx_media: List[Dict[str, str]] = []
+        if ev.chat_type == "group" and mode == "at":
             nick = (self._core.self_nick if self._core else "") or ""
             wxid = (self._core.self_wxid if self._core else "") or ""
             # at_usernames（list）是权威证据：空=确定没@；None=不可判定走文本兜底
@@ -408,11 +456,38 @@ class WeChatLocalAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             else:
                 mentioned = quoted_self or bool(nick and f"@{nick}" in text)
             if not mentioned:
-                return  # 群里没点名的消息不进队列（旁听/摘要是后续扩展）
+                return  # at 模式下没点名不进队列（历史仍在 DB 供上文/查询）
             # 命中后把 @片段从正文剥掉（atuserlist 命中时正文也可能带残留）
             if nick and f"@{nick}" in text:
                 text = re.sub(rf"@{re.escape(nick)}{_MENTION_TAIL_RE}",
                               "", text).strip()
+            # @之前的近期群聊上文：图片/文件无法带 @，用户常先发媒体再补
+            # 文字 @ —— 不拼的话前文媒体被整条丢弃（裸 @ 也能靠上文触发）。
+            if self._core and self.group_context_messages > 0:
+                try:
+                    ctx = await asyncio.to_thread(
+                        self._core.recent_context, ev.chat_id,
+                        ev.sort_seq, ev.local_id,
+                        self.group_context_messages)
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("wechatauto: group context fetch failed: %s", e)
+                    ctx = None
+                if ctx:
+                    lines = ctx.get("lines") or []
+                    if lines:
+                        head = "[群聊上文·未@消息仅作参考]\n" + "\n".join(lines)
+                        text = (head + "\n———\n" + text) if text.strip() else head
+                    ctx_media = ctx.get("media") or []
+        # 触发事件自身的媒体：download_media 全局关闭时也惰性解密——
+        # 只对过了准入/模式/mention 三道门、确定要派发的消息下载，
+        # 不给每条入站媒体都落盘（图片密钥瞬态，失败留 [type] 占位）。
+        if (not ev.media_path and self._core
+                and ev.type in ("image", "voice", "video", "file")):
+            try:
+                ev.media_path = await asyncio.to_thread(
+                    self._core.lazy_download_media, ev.chat_id, ev.local_id)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("wechatauto: lazy media download failed: %s", e)
         if not text.strip():
             return
         source = self.build_source(
@@ -425,10 +500,15 @@ class WeChatLocalAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             timestamp=(datetime.datetime.fromtimestamp(ev.timestamp)
                        if ev.timestamp else datetime.datetime.now()))
         # reply_expected 是新版字段（旧版 MessageEvent 无此 kwarg）：setattr 兼容两版
-        event.reply_expected = True if ev.chat_type == "dm" else mentioned or None
-        if ev.media_path:
-            event.media_urls = [ev.media_path]
-            event.media_types = [_media_mime(ev.type)]
+        event.reply_expected = (True if ev.chat_type == "dm"
+                                else (mode != "at" or mentioned) or None)
+        urls = ([ev.media_path] if ev.media_path else []) + [
+            m["path"] for m in ctx_media]
+        if urls:
+            event.media_urls = urls
+            event.media_types = ([_media_mime(ev.type)] if ev.media_path
+                                 else []) + [_media_mime(m["type"])
+                                            for m in ctx_media]
         await self.handle_message(event)
 
 

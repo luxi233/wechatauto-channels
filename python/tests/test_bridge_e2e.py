@@ -53,6 +53,11 @@ class _FakeWeChatDB:
     def get_sessions(self, limit=200):
         return [{"username": "wxid_friend", "unread": 1}]
 
+    def get_messages(self, username, limit=10):
+        return [{"local_id": 7, "sort_seq": 9000, "type": 1,
+                 "sender_username": "wxid_friend",
+                 "create_time": time.time() - 5, "content": "上文一条"}]
+
     def _msg_conns(self, user):
         return []
 
@@ -207,6 +212,18 @@ class TestBridgeE2E(unittest.TestCase):
     def test_07_unknown_path_404(self):
         code, _ = _req(self.port, "GET", "/nope")
         self.assertEqual(code, 404)
+
+    # ── listen 出口：/context 近期上文查询 ───────────────────────────
+    def test_08_context_endpoint(self):
+        code, body = _req(self.port, "GET",
+                          "/context?chat=" + urllib.parse.quote("好友甲"))
+        self.assertEqual(code, 200)
+        self.assertIn("好友甲: 上文一条", body["lines"])
+        self.assertEqual(body["media"], [])
+
+    def test_09_context_missing_chat_400(self):
+        code, _ = _req(self.port, "GET", "/context")
+        self.assertEqual(code, 400)
 
 
 if __name__ == "__main__":

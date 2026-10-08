@@ -71,6 +71,17 @@ def _canon_type(raw: Any) -> str:
     return _TYPE_CANON.get(t, low)
 
 
+_XML_TITLE_RE = re.compile(
+    r"<title[^>]*>\s*(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?\s*</title>", re.S)
+
+
+def _xml_title(xml: str) -> str:
+    """文件/链接/卡片 XML 里的 <title>（文件名/链接标题）——唯一的
+    用户可读字段，值得保留进 [type] 占位。"""
+    m = _XML_TITLE_RE.search(xml)
+    return (m.group(1).strip() if m else "")[:80]
+
+
 # ---------------------------------------------------------------------------
 # 出库行投影补丁：at_usernames / quoted（上游 _msg_row_to_dict 不投影）
 # ---------------------------------------------------------------------------
@@ -376,6 +387,100 @@ class ChannelCore:
             return hits[0].get("username")
         return None
 
+    def recent_context(self, chat: str, before_seq: int = 0,
+                       before_local_id: int = 0, limit: int = 8,
+                       max_age_s: float = 900.0) -> Dict[str, Any]:
+        """@触发前的近期群聊上文。
+
+        群聊里图片/文件消息无法带 @——用户典型姿势是先发媒体、再补一条
+        @机器人的文字。只派发 @ 消息会把前文媒体整条丢掉（Hermes 侧实测
+        反馈）。这里把该会话最近 limit 条**非本机**消息整理成
+        ``{"lines", "media"}``：lines 为时间序 ``"昵称: 正文/[类型]"``
+        参考行；media 为解密下载到的附件 ``[{path,type}]``——download_media
+        关闭时由 ``_lazy_media`` 只在这里懒建 downloader（图片密钥是瞬态
+        的，失败就只剩 [类型] 占位行）。
+        ``before_seq``/``before_local_id`` 排除触发消息自身与更新的行；
+        ``max_age_s`` 防止把几小时前的旧消息误当上文。
+        设计权衡见 .agents/notes/implemented/bug-fix/
+        2026-10-08-mention-context-media.md
+        """
+        lines: List[str] = []
+        media: List[Dict[str, str]] = []
+        if not self.db or limit <= 0:
+            return {"lines": lines, "media": media}
+        try:
+            rows = self.db.get_messages(chat, limit=max(limit * 3, 12)) or []
+        except Exception:  # noqa: BLE001
+            return {"lines": lines, "media": media}
+        now = time.time()
+        picked: List[ChannelEvent] = []
+        for m in rows:
+            try:
+                norm = self._normalize(chat, m)
+            except Exception:  # noqa: BLE001
+                continue
+            if not norm or norm.is_self:
+                continue
+            # 系统消息（撤回通知等 sysmsg/system 行）不是用户上文
+            if norm.type == "system" or "<sysmsg" in (norm.text or "")[:64]:
+                continue
+            if before_seq and norm.sort_seq >= before_seq:
+                continue
+            if before_local_id and norm.local_id == before_local_id:
+                continue
+            if max_age_s > 0 and norm.timestamp \
+                    and now - norm.timestamp > max_age_s:
+                continue
+            picked.append(norm)
+            if len(picked) >= limit:
+                break
+        for norm in reversed(picked):  # DB 最新在前 → 反回时间序
+            body = norm.text.strip() or f"[{norm.type}]"
+            lines.append(f"{norm.sender_name}: {body}")
+            mp = norm.media_path
+            if not mp and norm.type in ("image", "voice", "video", "file"):
+                # 上文媒体惰性下载：download_media 全局开关关闭时也在这里
+                # 懒建 downloader——只在 @触发时为这几条上文解密附件，
+                # 不给每条入站媒体都落盘。图片密钥是瞬态的，失败就留 [类型]
+                # 占位行，不影响正文。
+                dl = self._lazy_media()
+                if dl:
+                    try:
+                        mp = dl.download_media(chat, norm.local_id,
+                                               save_dir=self._media_dir)
+                    except Exception:  # noqa: BLE001
+                        mp = None
+            if mp:
+                media.append({"path": mp, "type": norm.type})
+        return {"lines": lines, "media": media}
+
+    def lazy_download_media(self, chat: str, local_id: int) -> Optional[str]:
+        """按需解密一条媒体消息——与 download_media 全局开关解耦。
+
+        供 adapter 在"确定要派发"之后调用（mention 门后）：DM 直发图片、
+        群里 @触发时上文媒体都由它解密，而不是给每条入站媒体都落盘。
+        图片密钥是瞬态的，发送时刻太久的附件可能已不可解。"""
+        dl = self._lazy_media()
+        if not dl:
+            return None
+        try:
+            return dl.download_media(chat, local_id, save_dir=self._media_dir)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _lazy_media(self):
+        """惰性 MediaDownloader（与 download_media 全局开关解耦）。"""
+        dl = getattr(self, "_ctx_media", None)
+        if dl is None:
+            try:
+                from wechatauto.media import MediaDownloader
+                dl = MediaDownloader(self.db)
+                dl.detect_image_key()
+            except Exception:  # noqa: BLE001
+                dl = False  # 探测失败只记一次，不反复重试
+            self._ctx_media = dl
+        return dl or None
+
     # ------------------------------------------------------------------
     # 写侧（GUI 驱动，调用方负责放到线程池）
     # ------------------------------------------------------------------
@@ -532,7 +637,16 @@ class ChannelCore:
                 text = text[m.end():].lstrip("\n")
 
         mtype = _canon_type(msg.get("type"))
-        if not text.strip():
+        stripped = text.lstrip()
+        if (mtype != "text"
+                and (stripped.startswith("<?xml")
+                     or stripped.startswith("<msg")
+                     or stripped.startswith("<sysmsg"))):
+            # 媒体/系统行的 content 是信封 XML（aeskey/cdn/md5 等元数据），
+            # 不是用户可见正文——原样泄给 agent 会被当成"这是什么"来回答。
+            title = _xml_title(stripped)
+            text = f"[{mtype}] {title}" if title else f"[{mtype}]"
+        elif not stripped:
             text = f"[{mtype}]"
 
         media_path = None

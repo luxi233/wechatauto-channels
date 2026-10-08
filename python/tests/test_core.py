@@ -46,10 +46,14 @@ class FakeDB:
     wxid = "wxid_self001"
     account = "wxid_self001_ab12"
 
-    def __init__(self, votes_rows=None, names=None, groups=None):
+    def __init__(self, votes_rows=None, names=None, groups=None, messages=None):
         self._votes_rows = votes_rows or []
         self._names = names or {}
         self._groups = groups or {}
+        self._messages = messages or {}
+
+    def get_messages(self, chat, limit=20):
+        return list(self._messages.get(chat, []))[:limit]
 
     def get_self_info(self):
         return {"username": self.wxid, "nick_name": "小助手"}
@@ -339,6 +343,112 @@ class TestRhythmDefault(unittest.TestCase):
         # 上游 >=1.2.3 默认 natural 会卡死 agent 分段回复；core import 即落 off
         import os
         self.assertEqual(os.environ.get("WECHATAUTO_RHYTHM"), "off")
+
+
+class TestRecentContext(unittest.TestCase):
+    """@触发前的近期群聊上文：图片/文件没法带 @，先发媒体再补 @ 的场景
+    前文不能被整条丢弃。"""
+
+    def _core(self, messages):
+        core = ChannelCore()
+        core.db = FakeDB(votes_rows=[(1, 0)],
+                         names={"wxid_friend": "好友甲", "wxid_bob": "大壮"},
+                         groups={"111@chatroom": "项目群"},
+                         messages=messages)
+        core.self_wxid = FakeDB.wxid
+        core.self_nick = "小助手"
+        return core
+
+    def test_image_before_mention_surfaces_as_context(self):
+        now = time.time()
+        rows = [
+            # 最新在前（DB 顺序）；触发消息本身 seq=100 应被 before_seq 排除
+            msg(local_id=3, sender_username="wxid_friend",
+                content="@小助手 看下", sort_seq=100, create_time=now),
+            msg(local_id=2, sender_username="wxid_bob", type="图片",
+                content="", sort_seq=99, create_time=now - 10),
+            msg(local_id=1, sender_username="wxid_bob",
+                content="wxid_bob:\n看这个", sort_seq=98, create_time=now - 20),
+        ]
+        core = self._core({"111@chatroom": rows})
+        ctx = core.recent_context("111@chatroom", before_seq=100,
+                                before_local_id=3, limit=8,
+                                max_age_s=900)
+        self.assertEqual(ctx["lines"], ["大壮: 看这个", "大壮: [image]"])
+
+    def test_self_and_stale_excluded(self):
+        now = time.time()
+        rows = [
+            msg(local_id=3, sender_username="wxid_friend",
+                content="旧的", sort_seq=50, create_time=now - 7200),  # >max_age
+            msg(local_id=2, sender_id=1, sender_username="wxid_self001",
+                content="我自己发的", sort_seq=60, create_time=now - 5),
+        ]
+        core = self._core({"111@chatroom": rows})
+        ctx = core.recent_context("111@chatroom", limit=8, max_age_s=900)
+        self.assertEqual(ctx["lines"], [])
+
+    def test_limit_and_time_order(self):
+        now = time.time()
+        rows = [msg(local_id=i, sender_username="wxid_friend",
+                    content=f"m{i}", sort_seq=200 - i,
+                    create_time=now - i) for i in range(6)]
+        core = self._core({"111@chatroom": rows})
+        ctx = core.recent_context("111@chatroom", limit=3)
+        # 取最新 3 条（rows 已按新→旧）再反转回时间序
+        self.assertEqual(len(ctx["lines"]), 3)
+        self.assertEqual(ctx["lines"][0], "好友甲: m2")
+        self.assertEqual(ctx["lines"][-1], "好友甲: m0")
+
+    def test_media_xml_envelope_becomes_placeholder(self):
+        # 回归：图片/文件行的 content 是 <msg><img aeskey=…> 信封 XML，
+        # 泄进上文会让 agent 把元数据当正文回答（线上实测复现）。
+        now = time.time()
+        img_xml = ('<?xml version="1.0"?><msg><img aeskey="k" '
+                   'cdnmidimgurl="u" length="1234"/></msg>')
+        file_xml = ('<msg><appmsg><title><![CDATA[周报.pdf]]></title>'
+                    '</appmsg></msg>')
+        rows = [
+            msg(local_id=2, sender_username="wxid_friend", type="图片",
+                content=img_xml, sort_seq=99, create_time=now - 5),
+            msg(local_id=1, sender_username="wxid_bob",
+                type="文件/链接/卡片", content=file_xml,
+                sort_seq=98, create_time=now - 10),
+        ]
+        core = self._core({"111@chatroom": rows})
+        ctx = core.recent_context("111@chatroom", limit=8, max_age_s=900)
+        self.assertEqual(ctx["lines"],
+                         ["大壮: [file] 周报.pdf", "好友甲: [image]"])
+
+    def test_sysmsg_not_in_context(self):
+        now = time.time()
+        rows = [
+            msg(local_id=2, sender_username="wxid_friend", type="系统消息",
+                content='<?xml version="1.0"?><sysmsg type="revokemsg">'
+                        "<revokemsg/></sysmsg>",
+                sort_seq=99, create_time=now - 5),
+            msg(local_id=1, sender_username="wxid_friend",
+                content="正常一句", sort_seq=98, create_time=now - 10),
+        ]
+        core = self._core({"111@chatroom": rows})
+        ctx = core.recent_context("111@chatroom", limit=8, max_age_s=900)
+        self.assertEqual(ctx["lines"], ["好友甲: 正常一句"])
+
+    def test_lazy_download_media_graceful_and_wired(self):
+        core = self._core({})
+        # 懒建探测失败路径（不 import 真 wechatauto.media——
+        # detect_image_key 会扫进程内存，单测不该碰）
+        core._ctx_media = False
+        self.assertIsNone(
+            core.lazy_download_media("wxid_friend", 1))
+
+        class _FakeDL:
+            def download_media(self, chat, local_id, save_dir=None):
+                return f"{save_dir or 'x'}/{chat}_{local_id}.jpg"
+
+        core._ctx_media = _FakeDL()  # 模拟懒建成功
+        p = core.lazy_download_media("wxid_friend", 42)
+        self.assertEqual(p, "x/wxid_friend_42.jpg")
 
 
 if __name__ == "__main__":

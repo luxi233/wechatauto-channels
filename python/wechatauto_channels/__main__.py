@@ -1,4 +1,10 @@
-"""``python -m wechatauto_channels`` → 启动 HTTP bridge（同 bridge.main）。"""
+"""``python -m wechatauto_channels`` → HTTP bridge；``recent`` → 上文查询。"""
+
+import sys
+
+if sys.argv[1:2] == ["recent"]:
+    from .cli import recent_main
+    raise SystemExit(recent_main(sys.argv[2:]))
 
 from .bridge import main
 
