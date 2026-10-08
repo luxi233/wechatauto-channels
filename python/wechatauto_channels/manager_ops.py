@@ -145,18 +145,51 @@ def bridge_health(cfg: dict, timeout: float = 5.0) -> dict | None:
         return None
 
 
+def _bridge_running() -> bool:
+    """桥在跑 = 端口能建立 TCP 连接（比按进程名找更准，pythonw 形态也覆盖）。"""
+    import socket
+    try:
+        with socket.create_connection(("127.0.0.1", 18765), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
 def bridge_pid() -> int | None:
-    """wechatauto-bridge.exe 的 pid；没跑返回 None。"""
+    """桥进程的 pid（exe 或 pythonw 形态）；没跑返回 None。"""
     try:
         out = subprocess.run(
-            ["tasklist", "/FI", "IMAGENAME eq wechatauto-bridge.exe",
-             "/FO", "CSV", "/NH"],
+            ["tasklist", "/FO", "CSV", "/NH", "/V"],
             capture_output=True, text=True, timeout=10,
             creationflags=_no_window()).stdout
+        # exe 形态
         m = re.search(r'"wechatauto-bridge\.exe","(\d+)"', out)
-        return int(m.group(1)) if m else None
+        if m:
+            return int(m.group(1))
+        # pythonw -m wechatauto_channels.bridge 形态：wmi 查命令行
+        wmi = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine "
+             "-match 'wechatauto_channels\\.bridge|wechatauto-bridge' } | "
+             "Select-Object -First 1 -ExpandProperty ProcessId"],
+            capture_output=True, text=True, timeout=15,
+            creationflags=_no_window()).stdout.strip()
+        return int(wmi) if wmi.isdigit() else None
     except Exception:
         return None
+
+
+def _bridge_argv(cfg: dict, exe: str) -> list[str]:
+    """构造桥启动 argv。优先用 venv 的 pythonw -m 模块形态：
+    wechatauto-bridge.exe 是 PyInstaller console 包，其孙进程会向
+    默认终端 AllocConsole 弹黑窗；pythonw 是 windowed 子系统，全链路无 console。"""
+    tail = ["--token", cfg["bridge"]["token"],
+            *cfg["bridge"].get("extra_args", [])]
+    exe_path = Path(exe)
+    pythonw = exe_path.parent / "pythonw.exe"
+    if exe_path.name.lower() == "wechatauto-bridge.exe" and pythonw.exists():
+        return [str(pythonw), "-m", "wechatauto_channels.bridge", *tail]
+    return [exe, *tail]
 
 
 def bridge_start(cfg: dict) -> tuple[bool, str]:
@@ -165,13 +198,13 @@ def bridge_start(cfg: dict) -> tuple[bool, str]:
     if not exe:
         return False, "找不到 wechatauto-bridge.exe（设置里可手动指定路径）"
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    args = [exe, "--token", cfg["bridge"]["token"],
-            *cfg["bridge"].get("extra_args", [])]
+    args = _bridge_argv(cfg, exe)
     try:
-        # Note: CREATE_BREAKAWAY_FROM_JOB + DETACHED_PROCESS —— 桥是宿主级
-        # 服务进程，不能随拉起者（GUI/agent shell）的 Job 清理连坐；Job 不允许
-        # breakaway 时回退普通 detached。失败记录见 .agents/notes/…manager-gui。
-        flags = (getattr(subprocess, "DETACHED_PROCESS", 0)
+        # CREATE_NO_WINDOW + CREATE_BREAKAWAY_FROM_JOB：隐藏 console（对
+        # pythonw 形态为无害空操作）+ 脱离拉起者的 Job 清理连坐。
+        # 注意不能用 DETACHED_PROCESS：exe 形态的孙进程无 console 可继承，
+        # 会自行 AllocConsole 在默认终端弹黑窗。
+        flags = (getattr(subprocess, "CREATE_NO_WINDOW", 0)
                  | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
                  | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0))
         try:
@@ -184,7 +217,7 @@ def bridge_start(cfg: dict) -> tuple[bool, str]:
                 args, stdin=subprocess.DEVNULL, close_fds=True,
                 stdout=open(BRIDGE_STDOUT_LOG, "ab"),
                 stderr=subprocess.STDOUT,
-                creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         log_line(f"bridge started pid={proc.pid} exe={exe}")
         return True, f"已启动 pid={proc.pid}"
     except Exception as e:
