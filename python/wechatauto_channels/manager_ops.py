@@ -1,0 +1,525 @@
+"""manager_ops — wechatauto 管理台的无 UI 操作层。
+
+manager.py（tkinter 界面）只做渲染与调度；所有探测、配置读写、
+进程管理、Octop API 交互都在这里，保证可用 pytest 覆盖。
+
+设计边界：
+- 全部 stdlib（sqlite3 / urllib / hmac / json），不依赖 PyJWT/PyYAML——
+  manager 可能跑在非 hermes venv 的 python 上。
+- Octop config.yaml 修改用定向文本编辑而非全量 yaml round-trip，
+  避免吞掉用户注释与格式。
+- bridge 无 /shutdown 端点，stop 只能 taskkill——这是 replica 侧边界。
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# paths / config
+# ---------------------------------------------------------------------------
+
+MANAGER_DIR = Path.home() / ".wechatauto"
+MANAGER_CFG = MANAGER_DIR / "manager.json"
+LOG_DIR = Path(os.environ.get("TEMP", str(Path.home()))) / "wechatauto-channels"
+MANAGER_LOG = LOG_DIR / "manager.log"
+BRIDGE_STDOUT_LOG = LOG_DIR / "bridge-stdout.log"
+
+DEFAULT_CFG = {
+    "bridge": {
+        "exe": "",            # 空 = 自动探测
+        "host": "127.0.0.1",
+        "port": 18765,
+        "token": "octop-e2e-token",
+        "extra_args": [],
+    },
+    "supervise": {
+        "enabled": True,
+        "interval_s": 15,
+        "restart_cooldown_s": 60,
+    },
+    "hermes_home": "",        # 空 = 自动探测
+    "octop_home": "",         # 空 = 自动探测
+    "repo_root": "",          # wechatauto-channels clone，注入用
+}
+
+
+def load_config() -> dict:
+    cfg = json.loads(json.dumps(DEFAULT_CFG))
+    try:
+        disk = json.loads(MANAGER_CFG.read_text(encoding="utf-8"))
+        for k, v in disk.items():
+            if isinstance(v, dict) and isinstance(cfg.get(k), dict):
+                cfg[k].update(v)
+            else:
+                cfg[k] = v
+    except Exception:
+        pass
+    return cfg
+
+
+def save_config(cfg: dict) -> None:
+    MANAGER_DIR.mkdir(parents=True, exist_ok=True)
+    MANAGER_CFG.write_text(
+        json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def log_line(text: str) -> None:
+    """追加一行到 manager.log（同时也是 GUI 日志窗的一个来源）。"""
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with MANAGER_LOG.open("a", encoding="utf-8") as f:
+            f.write(f"[{stamp}] {text}\n")
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# WeChat client
+# ---------------------------------------------------------------------------
+
+def wechat_running() -> bool:
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq Weixin.exe", "/NH"],
+            capture_output=True, text=True, timeout=10,
+            creationflags=_no_window()).stdout
+        return "Weixin.exe" in out
+    except Exception:
+        return False
+
+
+def _no_window() -> int:
+    return getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+# ---------------------------------------------------------------------------
+# bridge process
+# ---------------------------------------------------------------------------
+
+_BRIDGE_EXE_CANDIDATES = [
+    r"C:\Users\{u}\AppData\Local\hermes\hermes-agent\venv\Scripts\wechatauto-bridge.exe",
+]
+
+
+def find_bridge_exe(cfg: dict) -> str:
+    configured = cfg["bridge"].get("exe") or ""
+    if configured and Path(configured).exists():
+        return configured
+    which = shutil.which("wechatauto-bridge.exe") or shutil.which("wechatauto-bridge")
+    if which:
+        return which
+    user = os.environ.get("USERNAME", "")
+    for pat in _BRIDGE_EXE_CANDIDATES:
+        p = Path(pat.format(u=user))
+        if p.exists():
+            return str(p)
+    for cand in Path.home().glob("*/"):  # fallback: 扫常见 venv 目录
+        pass
+    return ""
+
+
+def bridge_health(cfg: dict, timeout: float = 5.0) -> dict | None:
+    """GET /health；成功返回 dict，任何失败返回 None。"""
+    b = cfg["bridge"]
+    url = f"http://{b['host']}:{b['port']}/health"
+    req = urllib.request.Request(
+        url, headers={"Authorization": f"Bearer {b['token']}"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+def bridge_pid() -> int | None:
+    """wechatauto-bridge.exe 的 pid；没跑返回 None。"""
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq wechatauto-bridge.exe",
+             "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=10,
+            creationflags=_no_window()).stdout
+        m = re.search(r'"wechatauto-bridge\.exe","(\d+)"', out)
+        return int(m.group(1)) if m else None
+    except Exception:
+        return None
+
+
+def bridge_start(cfg: dict) -> tuple[bool, str]:
+    """拉起桥。stdout/stderr 落到 bridge-stdout.log 供日志窗消费。"""
+    exe = find_bridge_exe(cfg)
+    if not exe:
+        return False, "找不到 wechatauto-bridge.exe（设置里可手动指定路径）"
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    args = [exe, "--token", cfg["bridge"]["token"],
+            *cfg["bridge"].get("extra_args", [])]
+    try:
+        # Note: CREATE_BREAKAWAY_FROM_JOB + DETACHED_PROCESS —— 桥是宿主级
+        # 服务进程，不能随拉起者（GUI/agent shell）的 Job 清理连坐；Job 不允许
+        # breakaway 时回退普通 detached。失败记录见 .agents/notes/…manager-gui。
+        flags = (getattr(subprocess, "DETACHED_PROCESS", 0)
+                 | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                 | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0))
+        try:
+            proc = subprocess.Popen(
+                args, stdin=subprocess.DEVNULL, close_fds=True,
+                stdout=open(BRIDGE_STDOUT_LOG, "ab"),
+                stderr=subprocess.STDOUT, creationflags=flags)
+        except OSError:
+            proc = subprocess.Popen(
+                args, stdin=subprocess.DEVNULL, close_fds=True,
+                stdout=open(BRIDGE_STDOUT_LOG, "ab"),
+                stderr=subprocess.STDOUT,
+                creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
+        log_line(f"bridge started pid={proc.pid} exe={exe}")
+        return True, f"已启动 pid={proc.pid}"
+    except Exception as e:
+        log_line(f"bridge start failed: {e}")
+        return False, str(e)
+
+
+def bridge_stop() -> tuple[bool, str]:
+    pid = bridge_pid()
+    if not pid:
+        return True, "桥没在运行"
+    r = subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                       capture_output=True, text=True, timeout=15,
+                       creationflags=_no_window())
+    ok = r.returncode == 0
+    log_line(f"bridge stop pid={pid} rc={r.returncode}")
+    return ok, r.stdout.strip() or r.stderr.strip()
+
+
+def bridge_wait_healthy(cfg: dict, timeout_s: float = 45.0) -> bool:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if bridge_health(cfg, timeout=3):
+            return True
+        time.sleep(1.5)
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Hermes
+# ---------------------------------------------------------------------------
+
+def hermes_home(cfg: dict) -> Path | None:
+    if cfg.get("hermes_home"):
+        p = Path(cfg["hermes_home"])
+        if p.exists():
+            return p
+    p = Path(os.environ.get("LOCALAPPDATA", "")) / "hermes"
+    return p if p.exists() else None
+
+
+def hermes_status(cfg: dict) -> dict:
+    home = hermes_home(cfg)
+    st = {"installed": False, "plugin": False, "whitelisted": False,
+          "platform_enabled": None, "connected": None, "home": str(home or "")}
+    if not home:
+        return st
+    st["installed"] = True
+    st["plugin"] = (home / "plugins" / "wechatauto" / "plugin.yaml").exists()
+    cfg_yaml = home / "config.yaml"
+    if cfg_yaml.exists():
+        text = cfg_yaml.read_text(encoding="utf-8", errors="replace")
+        st["whitelisted"] = bool(
+            re.search(r"plugins:[\s\S]*?enabled:[\s\S]*?wechatauto", text))
+        m = re.search(
+            r"platforms:\s*\n(?:\s+.+\n)*?\s+wechatauto:\s*\n\s+enabled:\s*(\w+)",
+            text)
+        if m:
+            st["platform_enabled"] = m.group(1).lower() in ("true", "yes")
+    gs = home / "gateway_state.json"
+    if gs.exists():
+        try:
+            state = json.loads(gs.read_text(encoding="utf-8"))
+            plat = state.get("platforms", {}).get("wechatauto", {})
+            st["connected"] = plat.get("state")
+        except Exception:
+            pass
+    return st
+
+
+def hermes_set_platform_enabled(cfg: dict, enabled: bool) -> tuple[bool, str]:
+    """定向改 config.yaml 里 platforms.wechatauto.enabled，不动其它行。"""
+    home = hermes_home(cfg)
+    if not home:
+        return False, "未检测到 Hermes 安装"
+    p = home / "config.yaml"
+    text = p.read_text(encoding="utf-8")
+    pat = re.compile(
+        r"(platforms:\s*\n(?:\s+.+\n)*?\s+wechatauto:\s*\n\s+enabled:\s*)\w+")
+    if not pat.search(text):
+        return False, "config.yaml 里没有 platforms.wechatauto.enabled 段"
+    new = pat.sub(rf"\g<1>{'true' if enabled else 'false'}", text, count=1)
+    p.write_text(new, encoding="utf-8")
+    log_line(f"hermes platform wechatauto.enabled -> {enabled}")
+    return True, "已写入，重启 gateway 生效"
+
+
+def hermes_inject_plugin(cfg: dict) -> tuple[bool, str]:
+    """把仓库 hermes/wechatauto 插件拷进 ~/.hermes/plugins/ + 白名单。"""
+    home = hermes_home(cfg)
+    repo = cfg.get("repo_root") or ""
+    src = Path(repo) / "hermes" / "wechatauto" if repo else None
+    if not home:
+        return False, "未检测到 Hermes 安装"
+    if not src or not src.exists():
+        return False, "manager.json 的 repo_root 未设置或插件目录不存在"
+    dst = home / "plugins" / "wechatauto"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        shutil.rmtree(dst)
+    shutil.copytree(src, dst)
+    # 确保 plugins.enabled 白名单含 wechatauto
+    cfg_yaml = home / "config.yaml"
+    text = cfg_yaml.read_text(encoding="utf-8") if cfg_yaml.exists() else ""
+    if not re.search(r"plugins:[\s\S]*?enabled:[\s\S]*?wechatauto", text):
+        if re.search(r"(plugins:\s*\n\s+enabled:\s*\n)", text):
+            text = re.sub(r"(plugins:\s*\n\s+enabled:\s*\n)",
+                          r"\g<1>    - wechatauto\n", text, count=1)
+        else:
+            text += "\nplugins:\n  enabled:\n    - wechatauto\n"
+        cfg_yaml.write_text(text, encoding="utf-8")
+    log_line(f"hermes plugin injected -> {dst}")
+    return True, f"已注入 {dst}"
+
+
+def hermes_gateway_restart(cfg: dict) -> tuple[bool, str]:
+    home = hermes_home(cfg)
+    if not home:
+        return False, "未检测到 Hermes"
+    exe = home / "hermes-agent" / "venv" / "Scripts" / "hermes.exe"
+    if not exe.exists():
+        return False, f"找不到 {exe}"
+    try:
+        r = subprocess.run([str(exe), "gateway", "restart"],
+                           capture_output=True, text=True, timeout=120,
+                           creationflags=_no_window())
+        out = (r.stdout or r.stderr or "").strip()[-400:]
+        log_line(f"hermes gateway restart rc={r.returncode} {out[:120]}")
+        return r.returncode == 0, out or f"rc={r.returncode}"
+    except Exception as e:
+        return False, str(e)
+
+
+# ---------------------------------------------------------------------------
+# Octop
+# ---------------------------------------------------------------------------
+
+def octop_home(cfg: dict) -> Path | None:
+    if cfg.get("octop_home"):
+        p = Path(cfg["octop_home"])
+        if p.exists():
+            return p
+    p = Path.home() / ".octop"
+    return p if p.exists() else None
+
+
+def _b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+def mint_jwt(secret: str | bytes, sub: str, uname: str, role: str,
+             ttl: int = 3600) -> str:
+    """stdlib 手写 HS256 JWT，不依赖 PyJWT。"""
+    key = secret.encode() if isinstance(secret, str) else secret
+    now = int(time.time())
+    head = _b64url(json.dumps(
+        {"alg": "HS256", "typ": "JWT"}, separators=(",", ":")).encode())
+    body = _b64url(json.dumps(
+        {"sub": str(sub), "uname": uname, "role": role,
+         "iat": now, "exp": now + ttl},
+        separators=(",", ":")).encode())
+    sig = _b64url(hmac.new(key, f"{head}.{body}".encode(),
+                           hashlib.sha256).digest())
+    return f"{head}.{body}.{sig}"
+
+
+def _octop_jwt(cfg: dict) -> tuple[str, Path] | tuple[None, None]:
+    home = octop_home(cfg)
+    if not home:
+        return None, None
+    db = home / "octop.db"
+    if not db.exists():
+        return None, None
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        secret = conn.execute(
+            "SELECT v FROM secrets WHERE k='jwt'").fetchone()[0]
+        uid, uname, role = conn.execute(
+            "SELECT id, username, role FROM users ORDER BY id LIMIT 1"
+        ).fetchone()
+    finally:
+        conn.close()
+    return mint_jwt(secret, uid, uname, role), db
+
+
+def octop_api(cfg: dict, method: str, path: str,
+              body: dict | None = None) -> tuple[int, dict | str]:
+    """调运行中 Octop 的本地 API。返回 (http_code, payload|error)。"""
+    token, _ = _octop_jwt(cfg)
+    if not token:
+        return -1, "无法签发 JWT（octop.db 缺失或无权）"
+    url = f"http://127.0.0.1:8088/api{path}"
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        url, data=data, method=method,
+        headers={"Authorization": f"Bearer {token}",
+                 "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw = resp.read().decode("utf-8")
+            return resp.status, json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8", errors="replace")[:300]
+    except Exception as e:
+        return -1, f"{type(e).__name__}: {e}"
+
+
+def octop_status(cfg: dict) -> dict:
+    home = octop_home(cfg)
+    st = {"installed": False, "adapter_files": False, "registered": False,
+          "channel_row": False, "connected": None, "name": "",
+          "channel_id": "", "home": str(home or "")}
+    if not home:
+        return st
+    pkg = home / "portable" / "packages" / "octop_gateway"
+    st["installed"] = pkg.exists()
+    st["adapter_files"] = (
+        pkg / "channels" / "wechatauto" / "channel.py").exists()
+    init = pkg / "channels" / "__init__.py"
+    if init.exists():
+        st["registered"] = "wechatauto" in init.read_text(
+            encoding="utf-8", errors="replace")
+    db = home / "octop.db"
+    if db.exists():
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            row = conn.execute(
+                "SELECT channel_id, name, enabled FROM channels "
+                "WHERE kind='wechatauto' LIMIT 1").fetchone()
+        except sqlite3.Error:
+            row = None
+        finally:
+            conn.close()
+        if row:
+            st["channel_row"] = True
+            st["channel_id"], st["name"] = row[0], row[1]
+    if st["channel_row"]:
+        code, payload = octop_api(
+            cfg, "GET", "/agents/main/channels")
+        if code == 200 and isinstance(payload, list):
+            for ch in payload:
+                if ch.get("kind") == "wechatauto":
+                    st["connected"] = ch.get("runtime", {}).get("connected")
+    return st
+
+
+def octop_channel_set_enabled(cfg: dict, enabled: bool) -> tuple[bool, str]:
+    st = octop_status(cfg)
+    cid = st.get("channel_id")
+    if not cid:
+        return False, "octop.db 里没有 wechatauto 渠道行（先注入）"
+    code, payload = octop_api(
+        cfg, "PATCH", f"/agents/main/channels/{cid}",
+        body={"enabled": enabled})
+    ok = code in (200, 204)
+    log_line(f"octop channel enabled={enabled} -> http {code}")
+    return ok, f"HTTP {code}"
+
+
+def octop_restart(cfg: dict) -> tuple[bool, str]:
+    code, payload = octop_api(cfg, "POST", "/update/restart")
+    log_line(f"octop restart -> http {code} {payload}")
+    return code in (200, 202), f"HTTP {code} {payload}"
+
+
+def octop_inject_adapter(cfg: dict) -> tuple[bool, str]:
+    """把仓库 octop adapter 拷进 portable 包 + 注册 _CHANNEL_MAP。"""
+    home = octop_home(cfg)
+    repo = cfg.get("repo_root") or ""
+    src = (Path(repo) / "octop" / "octop_gateway" / "channels" / "wechatauto"
+           if repo else None)
+    if not home:
+        return False, "未检测到 Octop"
+    pkg = home / "portable" / "packages" / "octop_gateway" / "channels"
+    if not pkg.exists():
+        return False, "octop_gateway 包不存在"
+    if not src or not src.exists():
+        return False, "repo_root 未设置或 adapter 源码不存在"
+    dst = pkg / "wechatauto"
+    if dst.exists():
+        shutil.rmtree(dst)
+    shutil.copytree(src, dst)
+    init = pkg / "__init__.py"
+    text = init.read_text(encoding="utf-8")
+    if "wechatauto" not in text:
+        text = re.sub(
+            r'(_CHANNEL_MAP\s*:\s*dict\[[^\]]*=\s*\{)',
+            r'\g<1>\n    "wechatauto": "wechatauto.channel:WechatAutoChannel",',
+            text, count=1)
+        init.write_text(text, encoding="utf-8")
+    log_line("octop adapter injected")
+    return True, "adapter 已注入并注册"
+
+
+# ---------------------------------------------------------------------------
+# OpenClaw
+# ---------------------------------------------------------------------------
+
+def openclaw_status(cfg: dict) -> dict:
+    st = {"installed": False, "plugin": False, "home": ""}
+    exe = shutil.which("openclaw") or shutil.which("openclaw.cmd")
+    home = Path.home() / ".openclaw"
+    st["home"] = str(home)
+    st["installed"] = bool(exe) or home.exists()
+    if home.exists():
+        for cand in home.glob("**/openclaw-wechatauto*"):
+            st["plugin"] = True
+            break
+    return st
+
+
+# ---------------------------------------------------------------------------
+# log sources（GUI 日志窗消费）
+# ---------------------------------------------------------------------------
+
+def log_sources(cfg: dict) -> dict[str, Path]:
+    sources = {
+        "manager.log": MANAGER_LOG,
+        "bridge-fatal.log": LOG_DIR / "bridge-fatal.log",
+        "bridge-stdout.log": BRIDGE_STDOUT_LOG,
+    }
+    home = hermes_home(cfg)
+    if home:
+        sources["hermes errors.log"] = home / "logs" / "errors.log"
+        sources["hermes gateway.log"] = home / "logs" / "gateway.log"
+    oh = octop_home(cfg)
+    if oh:
+        sources["octop.log"] = oh / "logs" / "octop.log"
+    return {k: v for k, v in sources.items() if v}
+
+
+def tail_lines(path: Path, n: int = 300) -> str:
+    try:
+        data = path.read_text(encoding="utf-8", errors="replace")
+        lines = data.splitlines()
+        return "\n".join(lines[-n:])
+    except Exception as e:
+        return f"<无法读取 {path}: {e}>"
