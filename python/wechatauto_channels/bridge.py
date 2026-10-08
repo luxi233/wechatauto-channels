@@ -7,6 +7,7 @@ OpenClaw 侧通过 ``GET /events?cursor=N&timeout_ms=30000`` 长轮询入站消�
 端点::
 
     GET  /health                      → {ok, wxid, nickname, media}
+    GET  /media?chat=X&local_id=N     → {ok, path}（按需解密媒体）
     GET  /chats                       → {chats: [{id,type,name,unread}]}
     GET  /chat?id=<username>          → {id,type,name}
     GET  /resolve?handle=<name>       → {username} | {username: null}
@@ -219,6 +220,23 @@ def make_handler(state: BridgeState):
                 handle = (q.get("handle") or [""])[0]
                 return _json_response(self, 200,
                                       {"username": state.core.resolve_target(handle)})
+            if path == "/media":
+                # 按需解密一条媒体消息——消费方（Octop/OpenClaw 等桥外
+                # adapter）的 lazy_download_media 出口，语义同 core：
+                # 图片密钥瞬态，过久的消息返回 ok:false。
+                chat = (q.get("chat") or [""])[0].strip()
+                try:
+                    local_id = int((q.get("local_id") or ["0"])[0])
+                except ValueError:
+                    return _json_response(self, 400,
+                                          {"ok": False, "error": "bad 'local_id'"})
+                if not chat or not local_id:
+                    return _json_response(
+                        self, 400,
+                        {"ok": False, "error": "missing chat/local_id"})
+                mp = state.core.lazy_download_media(chat, local_id)
+                return _json_response(
+                    self, 200, {"ok": bool(mp), "path": mp})
             if path == "/context":
                 # listen/旁听出口：任何群的近期上文查询（含未准入群——
                 # 持 token 即授权，bridge 不复用 adapter 策略表）。
