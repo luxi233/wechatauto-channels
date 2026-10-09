@@ -36,6 +36,8 @@ class ManagerApp(tk.Tk):
         self._stop = threading.Event()
         self._restart_count = 0
         self._last_restart = 0.0
+        self._last_octop_check = 0.0
+        self._last_reinject = 0.0
         self._build_ui()
         self._start_watchdog()
         self.after(500, self._drain_queue)
@@ -243,9 +245,10 @@ class ManagerApp(tk.Tk):
                     break
                 if not self.cfg["supervise"]["enabled"]:
                     continue
+                now = time.time()
+                self._maybe_reinject_octop(now)
                 if ops.bridge_health(self.cfg):
                     continue
-                now = time.time()
                 cooldown = self.cfg["supervise"].get(
                     "restart_cooldown_s", 60)
                 if now - self._last_restart < cooldown:
@@ -258,6 +261,33 @@ class ManagerApp(tk.Tk):
                 ops.log_line(
                     f"watchdog restart #{self._restart_count}: {msg}")
         threading.Thread(target=loop, daemon=True).start()
+
+    def _maybe_reinject_octop(self, now: float):
+        """Octop 升级会覆盖 portable 包里的注入 adapter。丢了就自动重注入。
+
+        触发条件：已安装 + DB 有渠道行（说明曾经注入过）+ adapter 文件或
+        _CHANNEL_MAP 注册丢失。扫描间隔 60s，重注入动作冷却 10min；
+        注入成功后重启后端加载新代码。
+        """
+        if not self.cfg["supervise"].get("octop_reinject", True):
+            return
+        if now - self._last_octop_check < 60:
+            return
+        self._last_octop_check = now
+        st = ops.octop_status(self.cfg)
+        if not (st["installed"] and st["channel_row"]):
+            return
+        if st["adapter_files"] and st["registered"]:
+            return
+        if now - self._last_reinject < 600:
+            return
+        self._last_reinject = now
+        ops.log_line("watchdog: octop adapter 丢失（疑似升级覆盖），自动重注入")
+        ok, msg = ops.octop_inject_adapter(self.cfg)
+        ops.log_line(f"watchdog reinject: ok={ok} {msg}")
+        if ok:
+            code, _ = ops.octop_api(self.cfg, "POST", "/update/restart")
+            ops.log_line(f"watchdog reinject: backend restart http={code}")
 
     # ------------------------------------------------------------ refresh
 
@@ -376,6 +406,7 @@ def _fmt_octop(st: dict) -> str:
             f"adapter 已注入:{st['adapter_files']}\n"
             f"已注册 _MAP:   {st['registered']}\n"
             f"渠道行:        {st['channel_row']}\n"
+            f"前端补丁:      {st.get('frontend_patched')}\n"
             f"渠道名:        {st['name']}\n"
             f"runtime:       connected={st['connected']}\n\n"
             f"说明：注入后需重启 Octop 后端才会加载新渠道代码；\n"

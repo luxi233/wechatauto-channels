@@ -49,10 +49,12 @@ DEFAULT_CFG = {
         "enabled": True,
         "interval_s": 15,
         "restart_cooldown_s": 60,
+        "octop_reinject": True,   # Octop 升级覆盖注入的 adapter 后自动重注入
     },
     "hermes_home": "",        # 空 = 自动探测
     "octop_home": "",         # 空 = 自动探测
     "repo_root": "",          # wechatauto-channels clone，注入用
+    "octop_repo": "",         # octop-gateway clone，空 = 探测 repo_root 兄弟目录
 }
 
 
@@ -429,7 +431,7 @@ def octop_status(cfg: dict) -> dict:
     home = octop_home(cfg)
     st = {"installed": False, "adapter_files": False, "registered": False,
           "channel_row": False, "connected": None, "name": "",
-          "channel_id": "", "home": str(home or "")}
+          "channel_id": "", "home": str(home or ""), "frontend_patched": False}
     if not home:
         return st
     pkg = home / "portable" / "packages" / "octop_gateway"
@@ -438,8 +440,16 @@ def octop_status(cfg: dict) -> dict:
         pkg / "channels" / "wechatauto" / "channel.py").exists()
     init = pkg / "channels" / "__init__.py"
     if init.exists():
-        st["registered"] = "wechatauto" in init.read_text(
-            encoding="utf-8", errors="replace")
+        text = init.read_text(encoding="utf-8", errors="replace")
+        st["registered"] = bool(
+            '"wechatauto": "octop_gateway.channels.wechatauto"' in text
+            and re.search(r'WECHATAUTO\s*=\s*"wechatauto"', text)
+            and '"wechatauto": "WechatAutoChannel"' in text)
+    assets = home / "portable" / "packages" / "octop" / "dashboard" / "assets"
+    for js in assets.glob("index.*.js"):
+        if "wechatauto" in js.read_text(encoding="utf-8", errors="replace"):
+            st["frontend_patched"] = True
+            break
     db = home / "octop.db"
     if db.exists():
         conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
@@ -483,31 +493,59 @@ def octop_restart(cfg: dict) -> tuple[bool, str]:
     return code in (200, 202), f"HTTP {code} {payload}"
 
 
-def octop_inject_adapter(cfg: dict) -> tuple[bool, str]:
-    """把仓库 octop adapter 拷进 portable 包 + 注册 _CHANNEL_MAP。"""
-    home = octop_home(cfg)
+def _octop_adapter_src(cfg: dict) -> Path | None:
+    """定位 adapter 源码目录：octop_repo 显式 > repo_root/octop/ 布局 >
+    repo_root 兄弟的 octop-gateway/src/ 布局。"""
+    rel = Path("src") / "octop_gateway" / "channels" / "wechatauto"
+    if cfg.get("octop_repo"):
+        cand = Path(cfg["octop_repo"]) / rel
+        return cand if cand.exists() else None
     repo = cfg.get("repo_root") or ""
-    src = (Path(repo) / "octop" / "octop_gateway" / "channels" / "wechatauto"
-           if repo else None)
+    if not repo:
+        return None
+    for cand in (Path(repo) / "octop" / "octop_gateway" / "channels"
+                 / "wechatauto",
+                 Path(repo).parent / "octop-gateway" / rel):
+        if cand.exists():
+            return cand
+    return None
+
+
+def octop_inject_adapter(cfg: dict) -> tuple[bool, str]:
+    """把仓库 octop adapter 拷进 portable 包 + 注册三处声明。"""
+    home = octop_home(cfg)
+    src = _octop_adapter_src(cfg)
     if not home:
         return False, "未检测到 Octop"
     pkg = home / "portable" / "packages" / "octop_gateway" / "channels"
     if not pkg.exists():
         return False, "octop_gateway 包不存在"
-    if not src or not src.exists():
-        return False, "repo_root 未设置或 adapter 源码不存在"
+    if not src:
+        return False, "找不到 adapter 源码（检查 repo_root/octop_repo）"
     dst = pkg / "wechatauto"
     if dst.exists():
         shutil.rmtree(dst)
     shutil.copytree(src, dst)
     init = pkg / "__init__.py"
     text = init.read_text(encoding="utf-8")
-    if "wechatauto" not in text:
+    # 注册共三处，各自幂等补齐（与仓库 channels/__init__.py 对齐）
+    if '"wechatauto": "octop_gateway.channels.wechatauto"' not in text:
         text = re.sub(
-            r'(_CHANNEL_MAP\s*:\s*dict\[[^\]]*=\s*\{)',
-            r'\g<1>\n    "wechatauto": "wechatauto.channel:WechatAutoChannel",',
+            r'(_CHANNEL_MAP\s*:\s*dict\[str, str\]\s*=\s*\{)',
+            r'\g<1>\n    "wechatauto": "octop_gateway.channels.wechatauto",',
             text, count=1)
-        init.write_text(text, encoding="utf-8")
+    if not re.search(r'WECHATAUTO\s*=\s*"wechatauto"', text):
+        text = re.sub(
+            r'(class ChannelKind\(StrEnum\):[\s\S]*?)(\n    \w+ = "[^"]+")'
+            r'(\n\n+)',
+            r'\g<1>\g<2>\n    WECHATAUTO = "wechatauto"\g<3>',
+            text, count=1)
+    if '"wechatauto": "WechatAutoChannel"' not in text:
+        text = re.sub(
+            r'(_CLASS_NAMES\s*:\s*dict\[str, str\]\s*=\s*\{)',
+            r'\g<1>\n    "wechatauto": "WechatAutoChannel",',
+            text, count=1)
+    init.write_text(text, encoding="utf-8")
     log_line("octop adapter injected")
     return True, "adapter 已注入并注册"
 
