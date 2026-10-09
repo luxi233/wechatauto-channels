@@ -373,3 +373,9 @@ def main(argv=None) -> int:
                        media_dir=args.media_dir)
     serve(args.host, args.port, token, core)
     return 0
+
+
+if __name__ == "__main__":
+    # python -m wechatauto_channels.bridge：没有这块守卫时 -m 形态静默退出
+    # （模块定义完即结束，rc=0 无输出），守护进程会陷入拉起-秒退循环。
+    raise SystemExit(main())
