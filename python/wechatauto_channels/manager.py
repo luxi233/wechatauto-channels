@@ -40,6 +40,7 @@ class ManagerApp(tk.Tk):
         self._last_restart = 0.0
         self._last_octop_check = 0.0
         self._last_reinject = 0.0
+        self._last_auto_open = 0.0
         self._build_ui()
         self._start_watchdog()
         self.after(500, self._drain_queue)
@@ -248,6 +249,7 @@ class ManagerApp(tk.Tk):
                 if not self.cfg["supervise"]["enabled"]:
                     continue
                 now = time.time()
+                self._auto_open_octop_resources(now)
                 self._maybe_reinject_octop(now)
                 if ops.bridge_health(self.cfg):
                     continue
@@ -290,6 +292,17 @@ class ManagerApp(tk.Tk):
         if ok:
             code, _ = ops.octop_api(self.cfg, "POST", "/update/restart")
             ops.log_line(f"watchdog reinject: backend restart http={code}")
+
+    def _auto_open_octop_resources(self, now: float):
+        """新建的 KB/连接器/技能包默认关闭 → IM 渠道永远裸奔。
+        每 60s 扫一次，自动把默认声明补齐（default_open / 绑定到 main）。"""
+        if not self.cfg["supervise"].get("auto_open_resources", True):
+            return
+        if now - self._last_auto_open < 60:
+            return
+        self._last_auto_open = now
+        for item in ops.octop_auto_open_defaults(self.cfg):
+            ops.log_line(f"auto-open: {item} 已开启默认注入")
 
     # ------------------------------------------------------------ refresh
 

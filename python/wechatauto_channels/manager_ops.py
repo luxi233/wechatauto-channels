@@ -50,6 +50,7 @@ DEFAULT_CFG = {
         "interval_s": 15,
         "restart_cooldown_s": 60,
         "octop_reinject": True,   # Octop 升级覆盖注入的 adapter 后自动重注入
+        "auto_open_resources": True,  # 新建 KB/连接器/技能包自动开默认声明
     },
     "hermes_home": "",        # 空 = 自动探测
     "octop_home": "",         # 空 = 自动探测
@@ -498,6 +499,82 @@ def octop_restart(cfg: dict) -> tuple[bool, str]:
     code, payload = octop_api(cfg, "POST", "/update/restart")
     log_line(f"octop restart -> http {code} {payload}")
     return code in (200, 202), f"HTTP {code} {payload}"
+
+
+def octop_auto_open_defaults(cfg: dict) -> list[str]:
+    """新资源自动开默认——watchdog 周期调用，幂等。
+
+    框架设计是"默认注入+模型自决策"：default_open 的资源进每轮候选，
+    渠道消息没人替用户点选，所以新资源默认关 = IM 渠道永远裸奔。
+    这里把三类资源的默认声明自动补齐：
+      - knowledge_bases.default_open=0 → 1（列级开关）
+      - connectors.config_json.default_open → true（JSON 内嵌）
+      - skill_packages 新包 → 追加进 main agent 的 skill_package_ids
+    返回本次翻动的资源描述列表，无翻动返回 []。
+    """
+    home = octop_home(cfg)
+    if not home:
+        return []
+    db = home / "octop.db"
+    if not db.exists():
+        return []
+    flipped: list[str] = []
+    conn = sqlite3.connect(str(db))
+    try:
+        cur = conn.cursor()
+        for rid, kb_id, name in cur.execute(
+                "SELECT id, knowledge_base_id, name FROM knowledge_bases"
+                " WHERE default_open=0").fetchall():
+            cur.execute(
+                "UPDATE knowledge_bases SET default_open=1,"
+                " updated_at=strftime('%s','now') WHERE id=?", (rid,))
+            flipped.append(f"kb:{name or kb_id}")
+        for rid, dname, cj in cur.execute(
+                "SELECT id, display_name, config_json FROM connectors"
+                ).fetchall():
+            try:
+                c = json.loads(cj) if cj else {}
+            except (ValueError, TypeError):
+                c = {}
+            if not isinstance(c, dict):
+                c = {}
+            if c.get("default_open") is True:
+                continue
+            c["default_open"] = True
+            cur.execute(
+                "UPDATE connectors SET config_json=?,"
+                " updated_at=strftime('%s','now') WHERE id=?",
+                (json.dumps(c, ensure_ascii=False), rid))
+            flipped.append(f"connector:{dname or rid}")
+        pkg_rows = cur.execute(
+            "SELECT skill_package_id, name FROM skill_packages").fetchall()
+        if pkg_rows:
+            row = cur.execute(
+                "SELECT skill_package_ids FROM agents WHERE agent_id='main'"
+            ).fetchone()
+            bound: set[str] = set()
+            if row and row[0]:
+                try:
+                    raw = json.loads(row[0])
+                    if isinstance(raw, list):
+                        bound = {str(x) for x in raw}
+                except (ValueError, TypeError):
+                    pass
+            missing = [(pid, name) for pid, name in pkg_rows
+                       if str(pid) not in bound]
+            if missing:
+                bound.update(str(pid) for pid, _ in missing)
+                cur.execute(
+                    "UPDATE agents SET skill_package_ids=?,"
+                    " updated_at=strftime('%s','now') WHERE agent_id='main'",
+                    (json.dumps(sorted(bound), ensure_ascii=False),))
+                flipped.extend(f"skill:{name or pid}" for pid, name in missing)
+        conn.commit()
+    except sqlite3.Error as e:
+        log_line(f"auto_open_defaults db error: {e}")
+    finally:
+        conn.close()
+    return flipped
 
 
 #: adapter 源码金本：不依赖 dev clone 存活，注入成功时自动回写保鲜
