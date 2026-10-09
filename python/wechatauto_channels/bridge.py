@@ -267,9 +267,12 @@ def make_handler(state: BridgeState):
                 except ValueError:
                     return _json_response(self, 400,
                                           {"ok": False, "error": "bad cursor/timeout"})
-                return _json_response(
-                    self, 200,
-                    state.buffer.wait(cursor, timeout_ms / 1000.0))
+                payload = state.buffer.wait(cursor, timeout_ms / 1000.0)
+                # 消费方用它在中途发现"桥被第三方重启"（adapter 只在
+                # start() 和自己 spawn 时校验 boot_id；watchdog 拉起
+                # 的场景会漏）——seq 空间已换，游标必须归零。
+                payload["boot_id"] = state.boot_id
+                return _json_response(self, 200, payload)
             return _json_response(self, 404, {"ok": False, "error": "not found"})
 
         def do_POST(self):

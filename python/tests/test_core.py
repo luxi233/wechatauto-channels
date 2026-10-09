@@ -236,6 +236,20 @@ class TestEventBuffer(unittest.TestCase):
         r3 = buf.wait(1, 1.0)
         self.assertEqual(len(r3["events"]), 1)
 
+    def test_stale_cursor_replays_buffer(self):
+        # 桥重启后 seq 归零：客户端攥着的旧游标（大于当前 max seq）说明
+        # 它在跟另一个实例的序号对话——归零重放，否则永久失明。
+        buf = EventBuffer()
+        ev = ChannelEvent(id="a:1", chat_id="a", chat_type="dm", chat_name="A",
+                          sender_id="a", sender_name="A", is_self=False,
+                          type="text", text="hi", timestamp=1.0,
+                          local_id=1, sort_seq=1)
+        buf.push(ev)
+        buf.push(ev)
+        r = buf.wait(20, 0.01)  # 上一个桥实例的游标
+        self.assertEqual(len(r["events"]), 2)
+        self.assertEqual(r["cursor"], 2)
+
 
 class TestResolveTarget(unittest.TestCase):
     def test_wxid_passthrough(self):

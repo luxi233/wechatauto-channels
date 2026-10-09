@@ -819,6 +819,13 @@ class EventBuffer:
         """返回 seq > cursor 的事件；timeout 内无事件则返回空列表。"""
         deadline = time.time() + max(0.0, timeout)
         with self._cond:
+            # cursor > 当前最大 seq 在本进程内不可能出现——只能是桥重启后
+            # seq 归零、而客户端还攥着旧实例的游标。归零重放整个缓冲区
+            # （消费方按事件 id 去重），否则该客户端会失明直到队列重新
+            # 涨到旧游标高度（真实事故：第三方拉起新桥，adapter 的
+            # cursor=20 把所有 seq<=20 的消息静默丢弃）。
+            if cursor > self._seq:
+                cursor = 0
             while True:
                 batch = [e for e in self._events if e["seq"] > cursor]
                 if batch:
