@@ -263,31 +263,50 @@ class TestGroupAllowlist(unittest.TestCase):
         self.assertTrue(st["enforced"])
         self.assertTrue(st["groups"][0]["stale"])
 
-    def test_set_writes_and_toggles(self):
-        cfg = self._mk_octop(tempfile.mkdtemp())
-        with mock.patch.object(ops, "octop_channel_set_enabled",
-                               return_value=(True, "ok")) as tgl:
+    def test_set_via_api_patches_full_config(self):
+        cfg = self._mk_octop(
+            tempfile.mkdtemp(), config={"token": "t", "other": 1})
+        calls = []
+
+        def fake_api(_cfg, method, path, body=None):
+            calls.append((method, path, body))
+            if method == "GET":
+                return 200, {"config": {"token": "t", "other": 1}}
+            return 200, {}
+
+        with mock.patch.object(ops, "octop_api", side_effect=fake_api):
             ok, msg = ops.octop_group_allowlist_set(cfg, ["111@chatroom"])
         self.assertTrue(ok, msg)
-        self.assertEqual(tgl.call_count, 2)  # off 一次 + on 一次
+        patch = [c for c in calls if c[0] == "PATCH"]
+        self.assertEqual(len(patch), 1)
+        sent = patch[0][2]["config"]
+        self.assertEqual(sent["group_allow"], ["111@chatroom"])
+        self.assertEqual(sent["token"], "t")       # 合并而非覆盖
+        self.assertEqual(sent["other"], 1)
+
+    def test_set_empty_disables_filter(self):
+        cfg = self._mk_octop(
+            tempfile.mkdtemp(), config={"group_allow": ["x@chatroom"]})
+
+        def fake_api(_cfg, method, path, body=None):
+            if method == "GET":
+                return 200, {"config": {"group_allow": ["x@chatroom"]}}
+            return 200, {}
+
+        with mock.patch.object(ops, "octop_api", side_effect=fake_api):
+            ok, _ = ops.octop_group_allowlist_set(cfg, [])
+        self.assertTrue(ok)
+
+    def test_set_db_fallback_when_backend_down(self):
+        cfg = self._mk_octop(tempfile.mkdtemp())
+        with mock.patch.object(ops, "octop_api", return_value=(-1, "down")):
+            ok, msg = ops.octop_group_allowlist_set(cfg, ["111@chatroom"])
+        self.assertTrue(ok, msg)
         conn = sqlite3.connect(str(Path(cfg["octop_home"]) / "octop.db"))
         cj = json.loads(conn.execute(
             "SELECT config_json FROM channels").fetchone()[0])
         conn.close()
         self.assertEqual(cj["group_allow"], ["111@chatroom"])
-
-    def test_set_empty_disables_filter(self):
-        cfg = self._mk_octop(
-            tempfile.mkdtemp(), config={"group_allow": ["x@chatroom"]})
-        with mock.patch.object(ops, "octop_channel_set_enabled",
-                               return_value=(True, "ok")):
-            ok, _ = ops.octop_group_allowlist_set(cfg, [])
-        self.assertTrue(ok)
-        conn = sqlite3.connect(str(Path(cfg["octop_home"]) / "octop.db"))
-        cj = json.loads(conn.execute(
-            "SELECT config_json FROM channels").fetchone()[0])
-        conn.close()
-        self.assertEqual(cj["group_allow"], [])
 
 
 class TestConfigRoundTrip(unittest.TestCase):

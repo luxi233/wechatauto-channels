@@ -247,6 +247,12 @@ class ManagerApp(tk.Tk):
                      ).pack(anchor="w")
 
     def _apply_groups(self):
+        if not self._group_vars:
+            # 列表还没渲染成功就点应用 = ids 为空 = 静默清空白名单。
+            # 曾经发生过（渲染消息被旧的双泵队列吞掉），挡住这发空炮。
+            messagebox.showinfo(
+                "应用群白名单", "群列表为空——请先点「刷新群列表」。", parent=self)
+            return
         ids = [gid for gid, v in self._group_vars.items() if v.get()]
 
         def work(cfg):
@@ -366,14 +372,26 @@ class ManagerApp(tk.Tk):
     # ------------------------------------------------------------ refresh
 
     def _drain_queue(self):
+        # 唯一消费者：op/status/groups 都在这里派发。曾经有两个泵抢同一
+        # 队列，各自吃掉对方的消息——表现为按钮点了没反应（像卡死）。
         try:
             while True:
                 kind, payload = self._ui_queue.get_nowait()
-                if kind == "op":
-                    label, ok, msg = payload
-                    ops.log_line(f"op[{label}] ok={ok} {msg}")
-                    if not ok:
-                        messagebox.showwarning(label, msg)
+                try:
+                    if kind == "op":
+                        label, ok, msg = payload
+                        ops.log_line(f"op[{label}] ok={ok} {msg}")
+                        if not ok:
+                            messagebox.showwarning(label, msg, parent=self)
+                    elif kind == "status":
+                        self._apply_status(payload)
+                    elif kind == "groups":
+                        self._render_groups(payload)
+                except Exception as e:
+                    # pythonw 无 stderr，tk 回调异常必须落盘否则泵死无尸
+                    ops.log_line(
+                        f"ui dispatch error [{kind}]: "
+                        f"{type(e).__name__}: {e}")
         except queue.Empty:
             pass
         self.after(400, self._drain_queue)
@@ -453,10 +471,6 @@ class ManagerApp(tk.Tk):
         self.log_text.insert("1.0", ops.tail_lines(path, 400))
         self.log_text.see("end")
 
-    # dispatch status updates from probe thread
-    def _apply_queued_status(self):
-        pass
-
     def destroy(self):
         self._stop.set()
         ops.log_line("manager gui closed")
@@ -493,20 +507,6 @@ def _fmt_openclaw(st: dict) -> str:
             f"插件已装:  {st['plugin']}\n")
 
 
-# status 轮询泵 —— probe 线程塞 queue，主线程取
-def _status_pump(app: ManagerApp):
-    try:
-        while True:
-            kind, payload = app._ui_queue.get_nowait()
-            if kind == "status":
-                app._apply_status(payload)
-            elif kind == "groups":
-                app._render_groups(payload)
-    except queue.Empty:
-        pass
-    app.after(300, lambda: _status_pump(app))
-
-
 def main():
     # 单实例守卫：两个 GUI = 两个 watchdog 抢同一个桥，虽无害但会造成
     # 重复拉起和日志错乱。lock 文件随进程退出自动释放。
@@ -523,7 +523,6 @@ def main():
             messagebox.showwarning("wechatauto 管理台", "已有实例在运行（托盘/后台）。本窗口退出。")
         return
     app = ManagerApp()
-    app.after(300, lambda: _status_pump(app))
     app.mainloop()
 
 

@@ -408,6 +408,8 @@ def _octop_jwt(cfg: dict) -> tuple[str, Path] | tuple[None, None]:
         uid, uname, role = conn.execute(
             "SELECT id, username, role FROM users ORDER BY id LIMIT 1"
         ).fetchone()
+    except (sqlite3.Error, TypeError, IndexError):
+        return None, None   # 残缺 DB（比如测试库没有 secrets 表）按离线处理
     finally:
         conn.close()
     return mint_jwt(secret, uid, uname, role), db
@@ -612,7 +614,8 @@ def octop_group_allowlist(cfg: dict) -> dict:
         f"http://{b['host']}:{b['port']}/chats",
         headers={"Authorization": f"Bearer {b['token']}"})
     try:
-        with urllib.request.urlopen(req, timeout=8) as resp:
+        # get_sessions 会撞 DB 快照合并的锁重试——间歇几秒是常态，8s 太短
+        with urllib.request.urlopen(req, timeout=15) as resp:
             chats = json.loads(resp.read().decode("utf-8")).get("chats") or []
     except Exception as e:
         st["error"] = f"桥 /chats 不可达: {e}"
@@ -632,7 +635,33 @@ def octop_group_allowlist(cfg: dict) -> dict:
 
 
 def octop_group_allowlist_set(cfg: dict, ids: list[str]) -> tuple[bool, str]:
-    """写 config_json.group_allow + toggle 渠道热重载。空列表 = 关闭过滤。"""
+    """改 config_json.group_allow。空列表 = 关闭过滤。
+
+    首选走 PATCH /agents/main/channels/{cid} —— update_channel 会写库并
+    原地 unregister/re-register 渠道（配置热重载内建），单次原子调用。
+    直接写 DB + toggle 的旧路子有个竞态：后端缓存的 config 会在渠道
+    重注册时把直写的值覆盖回去（白名单"看着写了实际没生效"）。
+    后端不可达时退回直写 DB，下次渠道注册时生效。
+    """
+    st = octop_status(cfg)
+    cid = st.get("channel_id")
+    if not cid:
+        return False, "没有 wechatauto 渠道行（先注入）"
+    ids = [str(x) for x in ids]
+    n = len(ids)
+    desc = "已关闭过滤（全部群可触发）" if not ids else f"白名单 {n} 个群"
+    code, detail = octop_api(cfg, "GET", f"/agents/main/channels/{cid}")
+    if code == 200 and isinstance(detail, dict):
+        conf = detail.get("config")
+        conf = dict(conf) if isinstance(conf, dict) else {}
+        conf["group_allow"] = ids
+        code, _ = octop_api(
+            cfg, "PATCH", f"/agents/main/channels/{cid}",
+            body={"config": conf})
+        ok = code in (200, 204)
+        log_line(f"group_allow set via api: {sorted(ids)} -> http {code}")
+        return ok, f"{desc}；渠道热重载 {'ok' if ok else f'HTTP {code}'}"
+    # 后端离线：直写 DB 兜底，渠道下次注册时生效
     home = octop_home(cfg)
     if not home or not (home / "octop.db").exists():
         return False, "octop.db 未找到"
@@ -641,32 +670,24 @@ def octop_group_allowlist_set(cfg: dict, ids: list[str]) -> tuple[bool, str]:
         row = conn.execute(
             "SELECT id, config_json FROM channels WHERE kind='wechatauto'"
             " LIMIT 1").fetchone()
-        if not row:
-            return False, "没有 wechatauto 渠道行（先注入）"
-        rid, cj = row
         try:
-            c = json.loads(cj) if cj else {}
+            c = json.loads(row[1]) if row and row[1] else {}
         except (ValueError, TypeError):
             c = {}
         if not isinstance(c, dict):
             c = {}
-        c["group_allow"] = [str(x) for x in ids]
+        c["group_allow"] = ids
         conn.execute(
             "UPDATE channels SET config_json=?,"
             " updated_at=strftime('%s','now') WHERE id=?",
-            (json.dumps(c, ensure_ascii=False), rid))
+            (json.dumps(c, ensure_ascii=False), row[0]))
         conn.commit()
     except sqlite3.Error as e:
         return False, f"写库失败: {e}"
     finally:
         conn.close()
-    ok1, _ = octop_channel_set_enabled(cfg, False)
-    time.sleep(1)
-    ok2, msg2 = octop_channel_set_enabled(cfg, True)
-    log_line(f"group_allow set: {sorted(ids)}; toggle {ok1}/{ok2}")
-    n = len(ids)
-    desc = "已关闭过滤（全部群可触发）" if not ids else f"白名单 {n} 个群"
-    return ok1 and ok2, f"{desc}；渠道热重载 {'ok' if ok1 and ok2 else msg2}"
+    log_line(f"group_allow set via db (backend down): {sorted(ids)}")
+    return True, f"{desc}；后端离线，下次启动生效"
 
 
 #: adapter 源码金本：不依赖 dev clone 存活，注入成功时自动回写保鲜
