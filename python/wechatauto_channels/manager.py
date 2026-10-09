@@ -401,6 +401,18 @@ def _status_pump(app: ManagerApp):
 
 
 def main():
+    # 单实例守卫：两个 GUI = 两个 watchdog 抢同一个桥，虽无害但会造成
+    # 重复拉起和日志错乱。lock 文件随进程退出自动释放。
+    lock_path = ops.LOG_DIR / "manager.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_fp = open(lock_path, "a+b")  # noqa: SIM115 - 生命周期=进程
+    try:
+        import msvcrt
+        lock_fp.seek(0)  # 所有实例锁同偏移，a+ 的 EOF 语义会导致各锁各的
+        msvcrt.locking(lock_fp.fileno(), msvcrt.LK_NBLCK, 1)
+    except (ImportError, OSError):
+        messagebox.showwarning("wechatauto 管理台", "已有实例在运行（托盘/后台）。本窗口退出。")
+        return
     app = ManagerApp()
     app.after(300, lambda: _status_pump(app))
     app.mainloop()
