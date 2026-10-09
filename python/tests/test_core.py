@@ -6,11 +6,9 @@
   3. split_text 分块 + EventBuffer 长轮询游标
 """
 
-import sqlite3
 import sys
 import threading
 import time
-import types
 import unittest
 from pathlib import Path
 

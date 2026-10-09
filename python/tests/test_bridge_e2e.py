@@ -7,7 +7,6 @@ GET /events 长轮询；POST /send → resolve_target → quick_send。
 
 import json
 import sys
-import threading
 import time
 import types
 import unittest

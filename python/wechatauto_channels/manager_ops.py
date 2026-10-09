@@ -129,8 +129,6 @@ def find_bridge_exe(cfg: dict) -> str:
         p = Path(pat.format(u=user))
         if p.exists():
             return str(p)
-    for cand in Path.home().glob("*/"):  # fallback: 扫常见 venv 目录
-        pass
     return ""
 
 
@@ -579,9 +577,7 @@ def openclaw_status(cfg: dict) -> dict:
     st["home"] = str(home)
     st["installed"] = bool(exe) or home.exists()
     if home.exists():
-        for cand in home.glob("**/openclaw-wechatauto*"):
-            st["plugin"] = True
-            break
+        st["plugin"] = any(home.glob("**/openclaw-wechatauto*"))
     return st
 
 
