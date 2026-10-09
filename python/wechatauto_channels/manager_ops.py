@@ -22,6 +22,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -94,13 +95,31 @@ def log_line(text: str) -> None:
 # WeChat client
 # ---------------------------------------------------------------------------
 
+def _checked_run(argv: list[str], timeout: float) -> tuple[int, str]:
+    """subprocess.run + capture_output 在 Windows 有死锁坑：超时 kill 后
+    communicate() 会 join 读管线程，若孙进程继承了管道句柄，EOF 永不
+    到来——timeout 形同虚设，调用线程永久泄漏（生产实测探针线程堆积）。
+    输出走临时文件：无管道 → 无读管线程 → timeout 语义真实生效。"""
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=LOG_DIR, suffix=".out")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            r = subprocess.run(argv, stdout=fh, stderr=subprocess.STDOUT,
+                               timeout=timeout, creationflags=_no_window())
+        out = Path(tmp).read_bytes().decode("utf-8", errors="replace")
+        return r.returncode, out
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+
+def _checked_output(argv: list[str], timeout: float) -> str:
+    return _checked_run(argv, timeout)[1]
+
+
 def wechat_running() -> bool:
     try:
-        out = subprocess.run(
-            ["tasklist", "/FI", "IMAGENAME eq Weixin.exe", "/NH"],
-            capture_output=True, text=True, timeout=10,
-            creationflags=_no_window()).stdout
-        return "Weixin.exe" in out
+        return "Weixin.exe" in _checked_output(
+            ["tasklist", "/FI", "IMAGENAME eq Weixin.exe", "/NH"], 10)
     except Exception:
         return False
 
@@ -159,22 +178,18 @@ def _bridge_running() -> bool:
 def bridge_pid() -> int | None:
     """桥进程的 pid（exe 或 pythonw 形态）；没跑返回 None。"""
     try:
-        out = subprocess.run(
-            ["tasklist", "/FO", "CSV", "/NH", "/V"],
-            capture_output=True, text=True, timeout=10,
-            creationflags=_no_window()).stdout
+        out = _checked_output(["tasklist", "/FO", "CSV", "/NH", "/V"], 10)
         # exe 形态
         m = re.search(r'"wechatauto-bridge\.exe","(\d+)"', out)
         if m:
             return int(m.group(1))
         # pythonw -m wechatauto_channels.bridge 形态：wmi 查命令行
-        wmi = subprocess.run(
+        wmi = _checked_output(
             ["powershell", "-NoProfile", "-Command",
              "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine "
              "-match 'wechatauto_channels\\.bridge|wechatauto-bridge' } | "
              "Select-Object -First 1 -ExpandProperty ProcessId"],
-            capture_output=True, text=True, timeout=15,
-            creationflags=_no_window()).stdout.strip()
+            15).strip()
         return int(wmi) if wmi.isdigit() else None
     except Exception:
         return None
@@ -239,12 +254,10 @@ def bridge_stop() -> tuple[bool, str]:
     pid = bridge_pid()
     if not pid:
         return True, "桥没在运行"
-    r = subprocess.run(["taskkill", "/F", "/PID", str(pid)],
-                       capture_output=True, text=True, timeout=15,
-                       creationflags=_no_window())
-    ok = r.returncode == 0
-    log_line(f"bridge stop pid={pid} rc={r.returncode}")
-    return ok, r.stdout.strip() or r.stderr.strip()
+    rc, out = _checked_run(["taskkill", "/F", "/PID", str(pid)], 15)
+    ok = rc == 0
+    log_line(f"bridge stop pid={pid} rc={rc}")
+    return ok, out.strip()
 
 
 def bridge_wait_healthy(cfg: dict, timeout_s: float = 45.0) -> bool:
@@ -351,12 +364,10 @@ def hermes_gateway_restart(cfg: dict) -> tuple[bool, str]:
     if not exe.exists():
         return False, f"找不到 {exe}"
     try:
-        r = subprocess.run([str(exe), "gateway", "restart"],
-                           capture_output=True, text=True, timeout=120,
-                           creationflags=_no_window())
-        out = (r.stdout or r.stderr or "").strip()[-400:]
-        log_line(f"hermes gateway restart rc={r.returncode} {out[:120]}")
-        return r.returncode == 0, out or f"rc={r.returncode}"
+        rc, raw = _checked_run([str(exe), "gateway", "restart"], 120)
+        out = raw.strip()[-400:]
+        log_line(f"hermes gateway restart rc={rc} {out[:120]}")
+        return rc == 0, out or f"rc={rc}"
     except Exception as e:
         return False, str(e)
 

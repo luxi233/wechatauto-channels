@@ -41,6 +41,7 @@ class ManagerApp(tk.Tk):
         self._last_octop_check = 0.0
         self._last_reinject = 0.0
         self._last_auto_open = 0.0
+        self._busy: set[str] = set()
         self._build_ui()
         self._start_watchdog()
         self.after(500, self._drain_queue)
@@ -75,6 +76,11 @@ class ManagerApp(tk.Tk):
             command=self._toggle_supervise).pack(side="left", padx=12)
         self.restart_lbl = tk.Label(bridge, text="守护重启: 0 次", fg=GREY)
         self.restart_lbl.pack(side="right", padx=6)
+
+        opbar = ttk.Frame(self)
+        opbar.pack(fill="x", padx=6)
+        self.op_state = tk.Label(opbar, text="", fg=GREY, anchor="w")
+        self.op_state.pack(fill="x")
 
         nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True, padx=6, pady=4)
@@ -205,13 +211,30 @@ class ManagerApp(tk.Tk):
     # ------------------------------------------------------------- actions
 
     def _run_bg(self, fn, label: str):
+        # 同名操作防重入：快速连点会叠出一串 PATCH/toggle 风暴——
+        # 每个 PATCH 都让渠道 unregister/register 一轮，后端越忙越容易
+        # 超时，超时又弹失败框……连点把系统打挂的链路从入口切断。
+        if label in self._busy:
+            ops.log_line(f"op[{label}] 进行中，忽略重复点击")
+            return
+        self._busy.add(label)
+
         def work():
             try:
                 ok, msg = fn(self.cfg)
             except Exception as e:
                 ok, msg = False, f"{type(e).__name__}: {e}"
+            finally:
+                self._busy.discard(label)
             self._ui_queue.put(("op", (label, ok, msg)))
         threading.Thread(target=work, daemon=True).start()
+
+    def _show_op_result(self, label: str, ok: bool, msg: str):
+        self.op_state.config(
+            text=f"{label}: {'✓' if ok else '✗'} {msg}",
+            fg=GREEN if ok else RED)
+        if ok:
+            self.after(8000, lambda: self.op_state.config(text="", fg=GREY))
 
     def _octop_restart_confirm(self):
         if messagebox.askyesno(
@@ -318,6 +341,13 @@ class ManagerApp(tk.Tk):
                 self._maybe_reinject_octop(now)
                 if ops.bridge_health(self.cfg):
                     continue
+                # /health 超时 ≠ 桥死：DB 合并/UIA 卡顿会让响应超 5s。
+                # 进程活着时乱 spawn 只会产锁死失败者（spawn-die 抖动）。
+                # TCP 能连上 = 进程在——记一笔，不动手。
+                if ops._bridge_running():
+                    ops.log_line(
+                        "watchdog: /health 超时但端口活着——跳过拉起")
+                    continue
                 cooldown = self.cfg["supervise"].get(
                     "restart_cooldown_s", 60)
                 if now - self._last_restart < cooldown:
@@ -381,8 +411,10 @@ class ManagerApp(tk.Tk):
                     if kind == "op":
                         label, ok, msg = payload
                         ops.log_line(f"op[{label}] ok={ok} {msg}")
-                        if not ok:
-                            messagebox.showwarning(label, msg, parent=self)
+                        # 失败不用模态框——弹窗一旦藏到别的窗口后面，
+                        # 主窗被 grab 住表现为"卡死"。状态条红字即可，
+                        # 详情在日志页可查。
+                        self._show_op_result(label, ok, msg)
                     elif kind == "status":
                         self._apply_status(payload)
                     elif kind == "groups":
