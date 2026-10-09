@@ -493,22 +493,25 @@ def octop_restart(cfg: dict) -> tuple[bool, str]:
     return code in (200, 202), f"HTTP {code} {payload}"
 
 
+#: adapter 源码金本：不依赖 dev clone 存活，注入成功时自动回写保鲜
+ADAPTER_GOLDEN = MANAGER_DIR / "adapter-src" / "wechatauto"
+
+
 def _octop_adapter_src(cfg: dict) -> Path | None:
     """定位 adapter 源码目录：octop_repo 显式 > repo_root/octop/ 布局 >
-    repo_root 兄弟的 octop-gateway/src/ 布局。"""
+    repo_root 兄弟的 octop-gateway/src/ 布局 > ~/.wechatauto 金本。"""
     rel = Path("src") / "octop_gateway" / "channels" / "wechatauto"
     if cfg.get("octop_repo"):
         cand = Path(cfg["octop_repo"]) / rel
         return cand if cand.exists() else None
     repo = cfg.get("repo_root") or ""
-    if not repo:
-        return None
-    for cand in (Path(repo) / "octop" / "octop_gateway" / "channels"
-                 / "wechatauto",
-                 Path(repo).parent / "octop-gateway" / rel):
-        if cand.exists():
-            return cand
-    return None
+    if repo:
+        for cand in (Path(repo) / "octop" / "octop_gateway" / "channels"
+                     / "wechatauto",
+                     Path(repo).parent / "octop-gateway" / rel):
+            if cand.exists():
+                return cand
+    return ADAPTER_GOLDEN if ADAPTER_GOLDEN.exists() else None
 
 
 def octop_inject_adapter(cfg: dict) -> tuple[bool, str]:
@@ -526,6 +529,12 @@ def octop_inject_adapter(cfg: dict) -> tuple[bool, str]:
     if dst.exists():
         shutil.rmtree(dst)
     shutil.copytree(src, dst)
+    if src != ADAPTER_GOLDEN:  # 用更新鲜的源回写金本
+        ADAPTER_GOLDEN.parent.mkdir(parents=True, exist_ok=True)
+        if ADAPTER_GOLDEN.exists():
+            shutil.rmtree(ADAPTER_GOLDEN)
+        shutil.copytree(src, ADAPTER_GOLDEN,
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     init = pkg / "__init__.py"
     text = init.read_text(encoding="utf-8")
     # 注册共三处，各自幂等补齐（与仓库 channels/__init__.py 对齐）

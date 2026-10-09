@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import queue
+import sys
 import threading
 import time
 import tkinter as tk
@@ -442,7 +443,9 @@ def main():
         lock_fp.seek(0)  # 所有实例锁同偏移，a+ 的 EOF 语义会导致各锁各的
         msvcrt.locking(lock_fp.fileno(), msvcrt.LK_NBLCK, 1)
     except (ImportError, OSError):
-        messagebox.showwarning("wechatauto 管理台", "已有实例在运行（托盘/后台）。本窗口退出。")
+        # --respawn：计划任务守护者调用，已有实例时静默退出不弹窗
+        if "--respawn" not in sys.argv:
+            messagebox.showwarning("wechatauto 管理台", "已有实例在运行（托盘/后台）。本窗口退出。")
         return
     app = ManagerApp()
     app.after(300, lambda: _status_pump(app))
