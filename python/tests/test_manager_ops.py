@@ -1,12 +1,15 @@
 """manager_ops 离线单测 —— JWT、配置读写、Hermes 开关编辑；不碰真进程/网络。"""
 
 import base64
+import copy
 import hashlib
 import hmac
 import json
+import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -178,6 +181,113 @@ class TestAutoOpenDefaults(unittest.TestCase):
         if (Path.home() / ".octop" / "octop.db").exists():
             self.skipTest("real octop.db present")
         self.assertEqual(ops.octop_auto_open_defaults(cfg), [])
+
+
+class TestGroupAllowlist(unittest.TestCase):
+    """群白名单：GUI 视图的群来自桥 /chats，名单写 config_json.group_allow。"""
+
+    def _mk_octop(self, tmp, config=None):
+        home = Path(tmp) / ".octop"
+        home.mkdir()
+        conn = sqlite3.connect(str(home / "octop.db"))
+        conn.executescript("""
+            CREATE TABLE channels (
+                id INTEGER PRIMARY KEY, channel_id TEXT, kind TEXT,
+                name TEXT, enabled INT, config_json TEXT,
+                created_at TEXT, updated_at TEXT);
+        """)
+        conn.execute(
+            "INSERT INTO channels (channel_id, kind, name, enabled,"
+            " config_json) VALUES ('C1','wechatauto','微',1,?)",
+            (json.dumps(config or {}, ensure_ascii=False),))
+        conn.commit()
+        conn.close()
+        return copy.deepcopy(ops.DEFAULT_CFG | {"octop_home": str(home)})
+
+    @staticmethod
+    def _fake_chats(chats):
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return json.dumps({"chats": chats}).encode()
+
+        return mock.patch.object(
+            ops.urllib.request, "urlopen", return_value=_Resp())
+
+    def test_view_lists_groups_with_allow_state(self):
+        cfg = self._mk_octop(
+            tempfile.mkdtemp(),
+            config={"group_allow": ["111@chatroom"]})
+        chats = [
+            {"id": "111@chatroom", "type": "group", "name": "有点东西"},
+            {"id": "222@chatroom", "type": "group", "name": "另一个群"},
+            {"id": "wxid_peer", "type": "dm", "name": "阿巴阿巴"},
+        ]
+        with self._fake_chats(chats):
+            st = ops.octop_group_allowlist(cfg)
+        self.assertTrue(st["enforced"])
+        self.assertEqual([g["id"] for g in st["groups"]],
+                         ["111@chatroom", "222@chatroom"])
+        self.assertTrue(st["groups"][0]["allowed"])
+        self.assertFalse(st["groups"][1]["allowed"])
+
+    def test_view_empty_allow_not_enforced(self):
+        cfg = self._mk_octop(tempfile.mkdtemp())
+        with self._fake_chats(
+                [{"id": "g@chatroom", "type": "group", "name": "G"}]):
+            st = ops.octop_group_allowlist(cfg)
+        self.assertFalse(st["enforced"])
+        self.assertFalse(st["groups"][0]["allowed"])
+
+    def test_view_keeps_stale_ids(self):
+        cfg = self._mk_octop(
+            tempfile.mkdtemp(), config={"group_allow": ["gone@chatroom"]})
+        with self._fake_chats([]):
+            st = ops.octop_group_allowlist(cfg)
+        self.assertEqual(len(st["groups"]), 1)
+        self.assertTrue(st["groups"][0]["stale"])
+        self.assertTrue(st["groups"][0]["allowed"])
+
+    def test_bridge_down_keeps_db_state(self):
+        cfg = self._mk_octop(
+            tempfile.mkdtemp(), config={"group_allow": ["111@chatroom"]})
+        with mock.patch.object(ops.urllib.request, "urlopen",
+                               side_effect=OSError("down")):
+            st = ops.octop_group_allowlist(cfg)
+        self.assertTrue(st["error"])
+        self.assertTrue(st["enforced"])
+        self.assertTrue(st["groups"][0]["stale"])
+
+    def test_set_writes_and_toggles(self):
+        cfg = self._mk_octop(tempfile.mkdtemp())
+        with mock.patch.object(ops, "octop_channel_set_enabled",
+                               return_value=(True, "ok")) as tgl:
+            ok, msg = ops.octop_group_allowlist_set(cfg, ["111@chatroom"])
+        self.assertTrue(ok, msg)
+        self.assertEqual(tgl.call_count, 2)  # off 一次 + on 一次
+        conn = sqlite3.connect(str(Path(cfg["octop_home"]) / "octop.db"))
+        cj = json.loads(conn.execute(
+            "SELECT config_json FROM channels").fetchone()[0])
+        conn.close()
+        self.assertEqual(cj["group_allow"], ["111@chatroom"])
+
+    def test_set_empty_disables_filter(self):
+        cfg = self._mk_octop(
+            tempfile.mkdtemp(), config={"group_allow": ["x@chatroom"]})
+        with mock.patch.object(ops, "octop_channel_set_enabled",
+                               return_value=(True, "ok")):
+            ok, _ = ops.octop_group_allowlist_set(cfg, [])
+        self.assertTrue(ok)
+        conn = sqlite3.connect(str(Path(cfg["octop_home"]) / "octop.db"))
+        cj = json.loads(conn.execute(
+            "SELECT config_json FROM channels").fetchone()[0])
+        conn.close()
+        self.assertEqual(cj["group_allow"], [])
 
 
 class TestConfigRoundTrip(unittest.TestCase):

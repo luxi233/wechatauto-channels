@@ -577,6 +577,98 @@ def octop_auto_open_defaults(cfg: dict) -> list[str]:
     return flipped
 
 
+def octop_group_allowlist(cfg: dict) -> dict:
+    """群白名单视图：桥 /chats 里的群 ∪ 当前 config_json.group_allow。
+
+    人只见群名不见群号——GUI 展示 name，底层存 ``*@chatroom`` id。
+    群来源是桥的会话表：发起过消息（被微信记录）的群天然在册。
+    返回 {groups: [{id,name,allowed,stale}], enforced, error}。
+    """
+    st = {"groups": [], "enforced": False, "error": ""}
+    home = octop_home(cfg)
+    if not home:
+        st["error"] = "octop home 未找到"
+        return st
+    db = home / "octop.db"
+    allow: set[str] = set()
+    if db.exists():
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            row = conn.execute(
+                "SELECT config_json FROM channels WHERE kind='wechatauto'"
+                " LIMIT 1").fetchone()
+            if row and row[0]:
+                cj = json.loads(row[0])
+                raw = cj.get("group_allow") or []
+                if isinstance(raw, list):
+                    allow = {str(x) for x in raw}
+        except (sqlite3.Error, ValueError, TypeError):
+            pass
+        finally:
+            conn.close()
+    st["enforced"] = bool(allow)
+    b = cfg["bridge"]
+    req = urllib.request.Request(
+        f"http://{b['host']}:{b['port']}/chats",
+        headers={"Authorization": f"Bearer {b['token']}"})
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            chats = json.loads(resp.read().decode("utf-8")).get("chats") or []
+    except Exception as e:
+        st["error"] = f"桥 /chats 不可达: {e}"
+        chats = []
+    seen: set[str] = set()
+    for c in chats:
+        if c.get("type") != "group" or not c.get("id"):
+            continue
+        seen.add(c["id"])
+        st["groups"].append({
+            "id": c["id"], "name": c.get("name") or c["id"],
+            "allowed": c["id"] in allow, "stale": False})
+    for gid in sorted(allow - seen):  # 已退出/无记录的群：保留展示可摘除
+        st["groups"].append({"id": gid, "name": gid, "allowed": True,
+                             "stale": True})
+    return st
+
+
+def octop_group_allowlist_set(cfg: dict, ids: list[str]) -> tuple[bool, str]:
+    """写 config_json.group_allow + toggle 渠道热重载。空列表 = 关闭过滤。"""
+    home = octop_home(cfg)
+    if not home or not (home / "octop.db").exists():
+        return False, "octop.db 未找到"
+    conn = sqlite3.connect(str(home / "octop.db"))
+    try:
+        row = conn.execute(
+            "SELECT id, config_json FROM channels WHERE kind='wechatauto'"
+            " LIMIT 1").fetchone()
+        if not row:
+            return False, "没有 wechatauto 渠道行（先注入）"
+        rid, cj = row
+        try:
+            c = json.loads(cj) if cj else {}
+        except (ValueError, TypeError):
+            c = {}
+        if not isinstance(c, dict):
+            c = {}
+        c["group_allow"] = [str(x) for x in ids]
+        conn.execute(
+            "UPDATE channels SET config_json=?,"
+            " updated_at=strftime('%s','now') WHERE id=?",
+            (json.dumps(c, ensure_ascii=False), rid))
+        conn.commit()
+    except sqlite3.Error as e:
+        return False, f"写库失败: {e}"
+    finally:
+        conn.close()
+    ok1, _ = octop_channel_set_enabled(cfg, False)
+    time.sleep(1)
+    ok2, msg2 = octop_channel_set_enabled(cfg, True)
+    log_line(f"group_allow set: {sorted(ids)}; toggle {ok1}/{ok2}")
+    n = len(ids)
+    desc = "已关闭过滤（全部群可触发）" if not ids else f"白名单 {n} 个群"
+    return ok1 and ok2, f"{desc}；渠道热重载 {'ok' if ok1 and ok2 else msg2}"
+
+
 #: adapter 源码金本：不依赖 dev clone 存活，注入成功时自动回写保鲜
 ADAPTER_GOLDEN = MANAGER_DIR / "adapter-src" / "wechatauto"
 

@@ -133,6 +133,30 @@ class ManagerApp(tk.Tk):
                    command=self._octop_restart_confirm).pack(
             side="left", padx=4)
 
+        gaf = ttk.LabelFrame(
+            f, text="群白名单（勾选=该群 @ 才回复；全不勾=不过滤）",
+            padding=6)
+        gaf.pack(fill="both", expand=True, pady=6)
+        bar2 = ttk.Frame(gaf)
+        bar2.pack(fill="x")
+        ttk.Button(bar2, text="刷新群列表",
+                   command=self._refresh_groups).pack(side="left", padx=4)
+        ttk.Button(bar2, text="应用白名单",
+                   command=self._apply_groups).pack(side="left", padx=4)
+        self.group_state = tk.Label(bar2, text="", fg=GREY)
+        self.group_state.pack(side="left", padx=8)
+        canvas = tk.Canvas(gaf, height=120, highlightthickness=0)
+        vs = ttk.Scrollbar(gaf, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vs.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        vs.pack(side="right", fill="y")
+        self.group_inner = ttk.Frame(canvas)
+        canvas.create_window((0, 0), window=self.group_inner, anchor="nw")
+        self.group_inner.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        self._group_vars = {}  # chat_id -> BooleanVar
+
     def _build_openclaw_tab(self, nb):
         f = ttk.Frame(nb, padding=8)
         nb.add(f, text="OpenClaw")
@@ -193,6 +217,41 @@ class ManagerApp(tk.Tk):
         if messagebox.askyesno(
                 "确认", "重启 Octop 后端？（约 10 秒，渠道会自动重连）"):
             self._run_bg(ops.octop_restart, "重启 Octop")
+
+    def _refresh_groups(self):
+        def work(cfg):
+            st = ops.octop_group_allowlist(cfg)
+            self._ui_queue.put(("groups", st))
+            return True, "群列表已刷新"
+        self._run_bg(work, "刷新群列表")
+
+    def _render_groups(self, st: dict):
+        for w in self.group_inner.winfo_children():
+            w.destroy()
+        self._group_vars = {}
+        if st["error"]:
+            self.group_state.config(text=f"⚠ {st['error']}")
+        else:
+            self.group_state.config(
+                text="白名单生效中" if st["enforced"]
+                else "未启用过滤——所有群 @ 都会回复")
+        for g in st["groups"]:
+            var = tk.BooleanVar(value=g["allowed"])
+            label = g["name"] + (f" [{g['id']}]" if g["stale"] else "")
+            ttk.Checkbutton(
+                self.group_inner, text=label, variable=var).pack(anchor="w")
+            self._group_vars[g["id"]] = var
+        if not st["groups"] and not st["error"]:
+            tk.Label(self.group_inner, fg=GREY,
+                     text="会话表无群记录——群里先发一条消息再刷新"
+                     ).pack(anchor="w")
+
+    def _apply_groups(self):
+        ids = [gid for gid, v in self._group_vars.items() if v.get()]
+
+        def work(cfg):
+            return ops.octop_group_allowlist_set(cfg, ids)
+        self._run_bg(work, "应用群白名单")
 
     def _bridge_start(self):
         self._run_bg(ops.bridge_start, "启动桥")
@@ -441,6 +500,8 @@ def _status_pump(app: ManagerApp):
             kind, payload = app._ui_queue.get_nowait()
             if kind == "status":
                 app._apply_status(payload)
+            elif kind == "groups":
+                app._render_groups(payload)
     except queue.Empty:
         pass
     app.after(300, lambda: _status_pump(app))
