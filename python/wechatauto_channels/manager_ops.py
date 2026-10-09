@@ -220,6 +220,15 @@ def bridge_start(cfg: dict) -> tuple[bool, str]:
                 stdout=open(BRIDGE_STDOUT_LOG, "ab"),
                 stderr=subprocess.STDOUT,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        # spawn 成功 ≠ 进程活着：-m 缺 __main__ 守卫那类 bug 会让桥
+        # rc=0 静默秒退，watchdog 空转一整夜才被发现。等一个启动窗口，
+        # 早夭就立刻读 stdout 尾部把死因报出来。
+        time.sleep(4)
+        rc = proc.poll()
+        if rc is not None:
+            tail = tail_lines(BRIDGE_STDOUT_LOG, 15) or "(无输出)"
+            log_line(f"bridge died instantly rc={rc}: {tail[-200:]}")
+            return False, f"桥启动后 {rc} 退出：{tail[-200:]}"
         log_line(f"bridge started pid={proc.pid} exe={exe}")
         return True, f"已启动 pid={proc.pid}"
     except Exception as e:
