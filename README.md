@@ -1,7 +1,8 @@
 # wechatauto-channels
 
 把 [wechatauto-replica](https://github.com/fanyuantaier/wechatauto-replica) 打造成
-**Hermes Agent** 和 **OpenClaw** 的个人微信消息渠道。
+**Octop**、**Hermes Agent** 和 **OpenClaw** 的个人微信消息渠道，
+并附带一个 Windows 管理台 GUI 负责拉起、守护和运维整条链路。
 
 读走本地 SQLCipher 数据库解密，写走 UIA+OCR 驱动真实客户端 —— 支持**私聊和群聊**，
 覆盖官方 iLink 通道（Hermes 内置 `weixin` / OpenClaw `@tencent-weixin/openclaw-weixin`）
@@ -10,26 +11,46 @@
 ## 架构
 
 ```
-┌──────────────────────────┐   ┌──────────────────────────────────┐
-│ Hermes 平台插件           │   │ OpenClaw 渠道插件（TS）            │
-│ hermes/wechatauto/     │   │ openclaw/openclaw-wechatauto/   │
-│  adapter.py (直 import)   │   │  monitor.ts → channelRuntime     │
-└──────────┬───────────────┘   └──────────────┬───────────────────┘
-           │                                  │ HTTP (127.0.0.1:18765)
-           │                    ┌─────────────▼───────────────────┐
-           │                    │ python -m wechatauto_channels        │
-           └───────────────────►│  /events 长轮询 · /send · /send_file │
-                               └─────────────┬───────────────────┘
-                                             │ wechatauto-replica
-                               ┌─────────────▼───────────────────┐
-                               │ Windows 本机微信 4.x（已登录）    │
-                               │ 读: SQLCipher DB · 写: UIA+OCR  │
-                               └─────────────────────────────────┘
+┌──────────────────┐ ┌──────────────────┐ ┌──────────────────────────┐
+│ Hermes 平台插件    │ │ Octop 渠道适配器   │ │ OpenClaw 渠道插件（TS）    │
+│ hermes/wechatauto│ │ (octop-gateway   │ │ openclaw/openclaw-       │
+│  直 import core   │ │  channels/wca)   │ │  wechatauto              │
+└────────┬─────────┘ └────────┬─────────┘ └──────────┬───────────────┘
+         │                    │ HTTP (127.0.0.1:18765, Bearer token)
+         │          ┌─────────▼──────────────────────────────────┐
+         │          │ pythonw -m wechatauto_channels.bridge        │
+         └─────────►│ /events 长轮询 · /send · /media · /context · │
+                   │ /chats · /health(boot_id) · 单实例锁          │
+                   └─────────┬──────────────────────▲─────────────┘
+                             │ wechatauto-replica    │ 拉起/探活/日志
+                   ┌─────────▼─────────┐   ┌────────┴─────────────┐
+                   │ 本机微信 4.x 客户端 │   │ 管理台 GUI + watchdog │
+                   │ 读 DB · 写 UIA/OCR │   │ (manager.py, tkinter)│
+                   └───────────────────┘   └──────────────────────┘
 ```
 
 单一事实源：`python/wechatauto_channels/core.py`（`ChannelCore`）做归一化——
-消息→`ChannelEvent`、昵称→username 解析、「是否自己发的」多证据判定。
-Hermes 适配器直接 import；OpenClaw 插件通过本地 HTTP 桥接同一套逻辑。
+消息→`ChannelEvent`、昵称→username 解析、「是否自己发的」多证据判定、
+收发节流与串行化。Hermes 适配器直接 import；Octop/OpenClaw 通过本地
+HTTP 桥消费同一套逻辑（Octop 适配器源码在
+[octop-gateway](https://github.com/TencentCloud/octop-gateway) 的
+`channels/wechatauto` 下，管理台可一键注入）。
+
+## Bridge HTTP 接口
+
+`GET` 全部需 `Authorization: Bearer <token>`（`--token` 或自动生成打印到控制台）：
+
+| 端点 | 说明 |
+|---|---|
+| `/health` | 活性 + `wxid`/`nickname` + **`boot_id`**（消费方据此发现桥被重启并重置游标） |
+| `/events?cursor=&timeout_ms=` | 长轮询事件流；响应回显 `boot_id`，`cursor > 当前 seq` 自动归零重放 |
+| `/send` `/send_file` (POST) | 发送文本/文件（全局串行锁，防 UIA 串台） |
+| `/context?chat=&n=` | 某会话最近 n 条消息（listen/旁听出口） |
+| `/media?chat=&local_id=` | 按需解密单条媒体消息（图片密钥瞬态，过期返回 `ok:false`） |
+| `/chats` `/chat?id=` `/resolve?handle=` | 会话列表 / 会话信息 / 名字→username 解析 |
+
+另有不依赖 bridge 的只读出口：`python -m wechatauto_channels recent <群名或wxid>`
+（独立 workdir 的快照读，可与运行中 bridge 共存）。
 
 ## 前置条件
 
@@ -85,6 +106,37 @@ openclaw wechatauto status   # 健康检查
 群聊默认 `allowlist` + `requireMention`：只有 `groupAllowFrom` 里的群、且消息里
 @了机器人昵称，才会派发给 agent。
 
+## 管理台 GUI（推荐入口）
+
+```bash
+pythonw -m wechatauto_channels.manager    # 无控制台窗口；重复启动自动聚焦已有实例
+```
+
+一个 tkinter 面板包揽整条链路的运维：
+
+- **状态卡**：微信 / bridge / Hermes / Octop / OpenClaw 实时探活
+- **桥控制**：拉起、停止、重启；15s watchdog 探活 + 60s 拉起冷却 +
+  spawn 早夭检测（起来 4s 内死掉会把退出码和 stderr 尾部写进日志）
+- **Octop 运维**：渠道注册注入 / 启停热重载 / 升级后适配器自动重注入 /
+  **群白名单**（按群名勾选，底层存 chat_id）/ 新建知识库·连接器·技能包
+  **自动开启默认注入**（60s 巡检，`supervise.auto_open_resources` 可关）
+- **Hermes 运维**：`platforms.wechatauto` 启停、插件注入、gateway 重启
+- **日志查看器**：manager.log / bridge stdout / fatal 崩溃日志一页看全
+- **守护链**：Windows 计划任务 `Wechatauto_Manager_Watchdog` 每 10 分钟
+  检查管理台本身，GUI 挂了也能被拉回
+
+## replica_compat —— 进程内补丁层
+
+`replica_compat.py` 对上游 wechatauto-replica 的已知缺陷做**幂等
+monkeypatch**（源码特征检测，上游修好自动跳过）：
+
+- 日志 file handler 改落到 `%TEMP%`（上游相对路径在 System32 CWD 下会
+  `PermissionError`）
+- `get_self_info` 的连接泄漏修复（不关连接会自锁 `contact.db`）
+- DB 快照打开/合并的瞬时 `OSError`/`PermissionError` 重试
+
+改 vendored 副本的活法重装即丢，这层不会。
+
 ## 「是不是我发的」判定（关键实现细节）
 
 微信 4.x 消息表里的 `real_sender_id` 是**分片内短编号**，同一个人换分片就换号——
@@ -129,9 +181,10 @@ openclaw wechatauto status   # 健康检查
 ## 测试
 
 ```bash
-cd python && python -m unittest discover -s tests -v    # 34 项，无需微信
-#    含 test_bridge_e2e.py：stub wechatauto → 真 HTTP 端到端
-cd openclaw/openclaw-wechatauto && npm test             # 8 项契约测试
+cd python && python -m unittest discover -s tests -v    # 60+ 项，无需微信
+#    test_bridge_e2e.py 需在无活动 bridge 的机器上跑（会占单实例锁）
+#    test_replica_compat.py 走 pytest
+cd openclaw/openclaw-wechatauto && npm test             # 契约测试
 ```
 
 真实收发验证必须在一台登录微信的 Windows 机器上跑：
