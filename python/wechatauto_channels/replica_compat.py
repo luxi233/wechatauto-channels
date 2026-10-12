@@ -231,10 +231,14 @@ def patch_file_paste_verified(guia_module: Any) -> str:
        True——对空输入框按回车等于没发，链路却一路报"已发送"。
 
     补丁：①改用 ``send_input_click`` 点输入框**中心**（实测稳定聚焦）；
-    ②文件草稿用 ``_input_box_has_text`` 检测（文件卡片文件名是深色文字，
-    命中其深色像素阈值），未就绪重试粘贴；③发送复用 ``click_send``
-    （回车→验证清空→OCR「发送」按钮兜底）；④草稿始终未出现返回
-    False——宁可报真实失败也不报假成功。
+    ②草稿/发送确认用**发送按钮颜色**（绿=有草稿、灰=已消费）——
+    ``_input_box_has_text`` 的深色像素判据会被空框光标+消息区溢出
+    像素假阳性，实测发送成功却误判失败；③未就绪重试粘贴至多 3 次；
+    ④Enter 后按钮不变灰则 OCR 定位「发送」点击兜底；⑤任何状态
+    迁移无法确认均返回 False，链路报真实失败而非假成功。
+
+    Note: 根因链与方案取舍 — 见
+    .agents/notes/implemented/bug-fix/2026-10-12-file-paste-blind-enter.md
     """
     name = "file_paste_verified"
     cls = getattr(guia_module, "WeChatGUI", None)
