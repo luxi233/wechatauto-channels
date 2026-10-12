@@ -12,9 +12,17 @@
 sqlite 连接导致 `os.replace` 自锁。当时直接改了 site-packages——重装或升级
 wechatauto-replica 即丢失，属于"修了但没沉淀"。
 
-本补丁层把三个修复收敛为进程内 monkeypatch（`replica_compat.py`），由
+本补丁层把修复收敛为进程内 monkeypatch（`replica_compat.py`），由
 `ChannelCore.start()` 在实例化 `WeChatDB` 前调用 `apply_replica_patches()`，
 bridge / Hermes adapter / CLI 全部自动覆盖。
+
+分发有两条腿：① `wechatauto_channels` 包内 `replica_compat.py`（上述
+主路径）；② Hermes 插件内 vendored 副本
+`hermes/wechatauto/_replica_compat.py`（2026-10-12 起）——pip 包由独立
+发布线维护、版本可能落后，插件 adapter 在构造 `ChannelCore`/`WeChatDB`
+前先跑包内 `apply_replica_patches()`、再跑 vendored 副本补缺口。补丁
+幂等（`_wac_safe` 标记）使双跑安全；两文件逐字节一致由
+`tests/test_vendored_sync.py` 防漂移。
 
 ## 补丁清单
 
@@ -23,6 +31,7 @@ bridge / Hermes adapter / CLI 全部自动覆盖。
 | `logger_file_handler` | 源码含 `gettempdir`/`expanduser` | 日志目录→`%TEMP%/wechatauto_logs`；OSError→哨兵 `False` 永不抛出；`_ensure_file_logger` 兜底吞一切异常 |
 | `get_self_info_close` | 源码含 `conn.close()` | 重写为 `try/finally: conn.close()` |
 | `open_transient_retry` | `_open` 源码含 `os.replace`/`_merge_wal`/`_open_unlocked`（不认识则跳过） | 瞬态 OSError/PermissionError 重试 2 次（0.3s/1s），RLock 串行 |
+| `file_paste_verified` | `_paste_attachment_and_send` 源码为已识别的盲发形态；含 `_input_box_has_text`/`click_send` 则视为上游已修 | 中心 `send_input_click` 聚焦、发送按钮绿/灰判草稿与发送确认、重试 3 次、OCR 兜底、失败诚实 False（详见 [file-paste-blind-enter](2026-10-12-file-paste-blind-enter.md)） |
 
 检测用 `inspect.getsource`：只对**识别出的缺陷形态**动手，形态不认识一律
 `skipped:unrecognized shape` 并记日志——宁漏勿错改。

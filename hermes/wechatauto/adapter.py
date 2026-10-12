@@ -74,6 +74,26 @@ def _preserve_root_logging():
         root.handlers[:] = saved_handlers
         root.setLevel(saved_level)
 
+
+def _apply_replica_compat() -> None:
+    """replica 缺陷补丁层：包内有就跑包内（新版优先），vendored 副本补缺口。
+
+    wechatauto_channels 由独立发布线维护——pip 包版本可能落后于本插件。
+    补丁随插件分发，保证插件装上就有补丁，不赌包的新旧。各补丁带
+    ``_wac_safe`` 幂等标记 + 源码形态检测，先包后 vendored 双跑安全：
+    包已打的 vendored 会跳过，包没有的新补丁由 vendored 补上。
+    """
+    try:
+        from wechatauto_channels.replica_compat import apply_replica_patches
+        apply_replica_patches()
+    except Exception:  # noqa: BLE001 — 包太旧无此模块等，交给 vendored
+        pass
+    try:
+        from . import _replica_compat
+        _replica_compat.apply_replica_patches()
+    except Exception:  # noqa: BLE001
+        logger.warning("wechatauto: vendored replica compat 未生效", exc_info=True)
+
 PLATFORM = "wechatauto"
 ENV_PREFIX = "WECHATAUTO"
 TRUTHY = {"1", "true", "yes", "on"}
@@ -237,6 +257,7 @@ class WeChatLocalAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
     def _make_core(self):
         with _preserve_root_logging():
             from wechatauto_channels.core import ChannelCore  # 懒导入：含 Windows-only 依赖
+        _apply_replica_compat()  # 先于 ChannelCore() 构造 WeChatDB/Listener
 
         return ChannelCore(
             account=self.account, db_dir=self.db_dir,
@@ -590,6 +611,7 @@ async def _standalone_send(pconfig, chat_id: str, message: str, *,
         with _preserve_root_logging():
             from wechatauto.db import WeChatDB
             from wechatauto_channels.core import ChannelCore, split_text
+        _apply_replica_compat()  # 先于下面 WeChatDB()/ChannelCore() 构造
 
         core = ChannelCore(account=str(_env(extra, "account", "") or "") or None,
                            db_dir=str(_env(extra, "db_dir", "") or "") or None)
