@@ -406,6 +406,32 @@ class TestSendFilePatch(unittest.TestCase):
         cfg, _ = self._mk(tempfile.mkdtemp(), body=None)
         self.assertIsNone(ops.octop_send_file_patch(cfg))
 
+    _DOC_ANCHOR = ('        """Send a file to the user through the '
+                   'chat channel.\n')
+
+    def test_doc_patch_applies_group_semantics(self):
+        cfg, target = self._mk(tempfile.mkdtemp(), self._DOC_ANCHOR)
+        self.assertIsNotNone(ops.octop_send_file_patch(cfg))
+        text = target.read_text(encoding="utf-8")
+        self.assertIn("current chat", text)
+        self.assertIn("group chats alike", text)
+
+    def test_doc_patch_independent_of_boundary_patch(self):
+        # 越界补丁已打（有 marker）但 docstring 未修 → 仍应补 docstring
+        cfg, target = self._mk(
+            tempfile.mkdtemp(),
+            "# PATCH(local)\n" + self._DOC_ANCHOR)
+        self.assertIsNotNone(ops.octop_send_file_patch(cfg))
+        self.assertIn("current chat",
+                      target.read_text(encoding="utf-8"))
+
+    def test_doc_patch_idempotent(self):
+        cfg, target = self._mk(tempfile.mkdtemp(), self._DOC_ANCHOR)
+        ops.octop_send_file_patch(cfg)
+        before = target.read_text(encoding="utf-8")
+        self.assertIsNone(ops.octop_send_file_patch(cfg))
+        self.assertEqual(target.read_text(encoding="utf-8"), before)
+
 
 class TestConfigRoundTrip(unittest.TestCase):
     def test_defaults(self):

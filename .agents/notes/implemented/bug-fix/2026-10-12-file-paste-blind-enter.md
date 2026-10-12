@@ -70,3 +70,9 @@
   `skipped:unrecognized`，fail-safe 方向正确。
 - 桥层 `verify` 仍是非必传参数；依赖调用方（Octop adapter 已开、
   Hermes adapter 待查）自觉开启。
+- 关联发现（同日，群聊）：渠道/桥/工具链对群聊发文件**无任何限制**，
+  但 `send_file_to_user` 的 docstring 写 "to the user"，模型在群语境
+  读成"仅私聊"而拒绝调用（群里两轮要 PDF 均回"无法发送"，零工具
+  调用）。已在 `octop_send_file_patch` 自愈补丁里加第二块：docstring
+  改为 "current chat … DMs and group chats alike"，与越界补丁同周期
+  重打、防升级覆盖。

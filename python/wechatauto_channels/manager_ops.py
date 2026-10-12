@@ -811,8 +811,21 @@ _SEND_FILE_PATCH_BLOCK = (
     "            ) from exc\n")
 
 
+# send_file_to_user 群语义补丁：docstring 只写 "to the user"，模型在群聊
+# 语境读成"仅私聊"而拒绝调用（2026-10-12 实锤：群里要 PDF 两轮均回
+# "无法发送文件"，从未调工具）。改为"发到当前会话（群/私聊皆可）"。
+_SEND_FILE_DOC_MARKER = "current chat"
+_SEND_FILE_DOC_ANCHOR = (
+    '        """Send a file to the user through the chat channel.\n')
+_SEND_FILE_DOC_BLOCK = (
+    '        """Send a file to the current chat through the channel.\n'
+    "\n"
+    "        Delivers to whatever conversation triggered this turn — DMs and\n"
+    "        group chats alike; in a group it is posted into that group.\n")
+
+
 def octop_send_file_patch(cfg: dict) -> str | None:
-    """send_file_to_user 越界补丁存活检查，缺失则重打。返回动作描述或 None。"""
+    """send_file_to_user 补丁存活检查（越界降级 + 群语义），缺失则重打。"""
     home = octop_home(cfg)
     if not home:
         return None
@@ -821,18 +834,29 @@ def octop_send_file_patch(cfg: dict) -> str | None:
     if not target.exists():
         return None
     text = target.read_text(encoding="utf-8")
-    if _SEND_FILE_PATCH_MARKER in text:
+    applied: list[str] = []
+    if _SEND_FILE_PATCH_MARKER not in text:
+        if _SEND_FILE_PATCH_ANCHOR not in text:
+            log_line("send_file patch: 越界锚点不匹配（上游已改版？）——人工核查")
+        else:
+            text = text.replace(
+                _SEND_FILE_PATCH_ANCHOR, _SEND_FILE_PATCH_BLOCK, 1)
+            applied.append("越界降级")
+    if _SEND_FILE_DOC_MARKER not in text:
+        if _SEND_FILE_DOC_ANCHOR not in text:
+            log_line("send_file patch: docstring 锚点不匹配（上游已改版？）——人工核查")
+        else:
+            text = text.replace(
+                _SEND_FILE_DOC_ANCHOR, _SEND_FILE_DOC_BLOCK, 1)
+            applied.append("群语义 docstring")
+    if not applied:
         return None
-    if _SEND_FILE_PATCH_ANCHOR not in text:
-        log_line("send_file patch: 锚点代码不匹配（上游已改版？）——人工核查")
-        return None
-    target.write_text(
-        text.replace(_SEND_FILE_PATCH_ANCHOR, _SEND_FILE_PATCH_BLOCK, 1),
-        encoding="utf-8")
+    target.write_text(text, encoding="utf-8")
     for stale in (target.parent / "__pycache__").glob("send_file*.pyc"):
         stale.unlink(missing_ok=True)
-    log_line("send_file patch: 越界降级补丁已（重新）应用，后端重启后生效")
-    return "send_file_to_user 越界补丁已重打（下次后端重启生效）"
+    desc = "+".join(applied)
+    log_line(f"send_file patch: {desc} 已（重新）应用，后端重启后生效")
+    return f"send_file_to_user {desc}补丁已重打（下次后端重启生效）"
 
 
 def adapter_golden() -> Path:
