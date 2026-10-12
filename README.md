@@ -187,6 +187,12 @@ cd python && python -m unittest discover -s tests -v    # 60+ 项，无需微信
 cd openclaw/openclaw-wechatauto && npm test             # 契约测试
 ```
 
+改代码/发版前必跑最低门禁（只挡真 bug，不做风格检查）：
+
+```bash
+ruff check python/          # 规则固定在 python/pyproject.toml：F + E9 + B
+```
+
 真实收发验证必须在一台登录微信的 Windows 机器上跑：
 `python -m wechatauto_channels` 起来后 `curl http://127.0.0.1:18765/health`。
 

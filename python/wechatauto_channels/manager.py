@@ -41,6 +41,7 @@ class ManagerApp(tk.Tk):
         self._last_octop_check = 0.0
         self._last_reinject = 0.0
         self._last_auto_open = 0.0
+        self._last_allowlist_guard = 0.0
         self._busy: set[str] = set()
         self._build_ui()
         self._start_watchdog()
@@ -339,6 +340,7 @@ class ManagerApp(tk.Tk):
                 now = time.time()
                 self._auto_open_octop_resources(now)
                 self._maybe_reinject_octop(now)
+                self._guard_octop_allowlist(now)
                 if ops.bridge_health(self.cfg):
                     continue
                 # /health 超时 ≠ 桥死：DB 合并/UIA 卡顿会让响应超 5s。
@@ -398,6 +400,18 @@ class ManagerApp(tk.Tk):
         self._last_auto_open = now
         for item in ops.octop_auto_open_defaults(self.cfg):
             ops.log_line(f"auto-open: {item} 已开启默认注入")
+
+    def _guard_octop_allowlist(self, now: float):
+        """dashboard 保存渠道会丢掉自定义的 group_allow——60s 扫一次，
+        漂移了就从 manager.json 里的期望值重放回去。"""
+        if not self.cfg["supervise"].get("allowlist_guard", True):
+            return
+        if now - self._last_allowlist_guard < 60:
+            return
+        self._last_allowlist_guard = now
+        note = ops.octop_allowlist_guard(self.cfg)
+        if note:
+            ops.log_line(f"allowlist guard: {note}")
 
     # ------------------------------------------------------------ refresh
 
@@ -542,7 +556,7 @@ def _fmt_openclaw(st: dict) -> str:
 def main():
     # 单实例守卫：两个 GUI = 两个 watchdog 抢同一个桥，虽无害但会造成
     # 重复拉起和日志错乱。lock 文件随进程退出自动释放。
-    lock_path = ops.LOG_DIR / "manager.lock"
+    lock_path = ops.log_dir() / "manager.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock_fp = open(lock_path, "a+b")  # noqa: SIM115 - 生命周期=进程
     try:

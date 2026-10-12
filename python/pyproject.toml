@@ -21,3 +21,12 @@ wechatauto-manager = "wechatauto_channels.manager:main"
 
 [tool.setuptools.packages.find]
 include = ["wechatauto_channels*"]
+
+[tool.ruff]
+# 最低门禁：只挡真 bug，不做风格警察。
+# F=Pyflakes（未定义名/未用 import，F821 曾抓到管理台按钮必崩）
+# E9=pycodestyle 语法级错误，B=flake8-bugbear 常见陷阱
+lint.select = ["F", "E9", "B"]
+lint.ignore = [
+    "B008",  # 函数调用作默认参数——本仓库无此误伤场景前先放开
+]

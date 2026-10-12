@@ -32,9 +32,41 @@ from pathlib import Path
 # paths / config
 # ---------------------------------------------------------------------------
 
-MANAGER_DIR = Path.home() / ".wechatauto"
+def _env_path(name: str, default: Path) -> Path:
+    v = os.environ.get(name)
+    return Path(v) if v else default
+
+
+def manager_dir() -> Path:
+    """~/.wechatauto，可用 WECHATAUTO_HOME 覆盖（测试隔离用）。"""
+    return _env_path("WECHATAUTO_HOME", Path.home() / ".wechatauto")
+
+
+def log_dir() -> Path:
+    """%TEMP%/wechatauto-channels，可用 WECHATAUTO_LOG_DIR 覆盖。"""
+    return _env_path(
+        "WECHATAUTO_LOG_DIR",
+        Path(os.environ.get("TEMP", str(Path.home()))) / "wechatauto-channels",
+    )
+
+
+def manager_cfg_path() -> Path:
+    return manager_dir() / "manager.json"
+
+
+def manager_log_path() -> Path:
+    return log_dir() / "manager.log"
+
+
+def bridge_stdout_log_path() -> Path:
+    return log_dir() / "bridge-stdout.log"
+
+
+# 默认快照，仅作展示/兼容；函数内部一律走上面的动态解析，
+# 保证测试导入后设置环境变量即可完全隔离真实 ~/.wechatauto 与日志。
+MANAGER_DIR = manager_dir()
 MANAGER_CFG = MANAGER_DIR / "manager.json"
-LOG_DIR = Path(os.environ.get("TEMP", str(Path.home()))) / "wechatauto-channels"
+LOG_DIR = log_dir()
 MANAGER_LOG = LOG_DIR / "manager.log"
 BRIDGE_STDOUT_LOG = LOG_DIR / "bridge-stdout.log"
 
@@ -63,7 +95,7 @@ DEFAULT_CFG = {
 def load_config() -> dict:
     cfg = json.loads(json.dumps(DEFAULT_CFG))
     try:
-        disk = json.loads(MANAGER_CFG.read_text(encoding="utf-8"))
+        disk = json.loads(manager_cfg_path().read_text(encoding="utf-8"))
         for k, v in disk.items():
             if isinstance(v, dict) and isinstance(cfg.get(k), dict):
                 cfg[k].update(v)
@@ -75,17 +107,17 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict) -> None:
-    MANAGER_DIR.mkdir(parents=True, exist_ok=True)
-    MANAGER_CFG.write_text(
+    manager_dir().mkdir(parents=True, exist_ok=True)
+    manager_cfg_path().write_text(
         json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def log_line(text: str) -> None:
     """追加一行到 manager.log（同时也是 GUI 日志窗的一个来源）。"""
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_dir().mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y-%m-%d %H:%M:%S")
     try:
-        with MANAGER_LOG.open("a", encoding="utf-8") as f:
+        with manager_log_path().open("a", encoding="utf-8") as f:
             f.write(f"[{stamp}] {text}\n")
     except OSError:
         pass
@@ -100,8 +132,8 @@ def _checked_run(argv: list[str], timeout: float) -> tuple[int, str]:
     communicate() 会 join 读管线程，若孙进程继承了管道句柄，EOF 永不
     到来——timeout 形同虚设，调用线程永久泄漏（生产实测探针线程堆积）。
     输出走临时文件：无管道 → 无读管线程 → timeout 语义真实生效。"""
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=LOG_DIR, suffix=".out")
+    log_dir().mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=log_dir(), suffix=".out")
     try:
         with os.fdopen(fd, "wb") as fh:
             r = subprocess.run(argv, stdout=fh, stderr=subprocess.STDOUT,
@@ -213,7 +245,7 @@ def bridge_start(cfg: dict) -> tuple[bool, str]:
     exe = find_bridge_exe(cfg)
     if not exe:
         return False, "找不到 wechatauto-bridge.exe（设置里可手动指定路径）"
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_dir().mkdir(parents=True, exist_ok=True)
     args = _bridge_argv(cfg, exe)
     try:
         # CREATE_NO_WINDOW + CREATE_BREAKAWAY_FROM_JOB：隐藏 console（对
@@ -226,12 +258,12 @@ def bridge_start(cfg: dict) -> tuple[bool, str]:
         try:
             proc = subprocess.Popen(
                 args, stdin=subprocess.DEVNULL, close_fds=True,
-                stdout=open(BRIDGE_STDOUT_LOG, "ab"),
+                stdout=open(bridge_stdout_log_path(), "ab"),
                 stderr=subprocess.STDOUT, creationflags=flags)
         except OSError:
             proc = subprocess.Popen(
                 args, stdin=subprocess.DEVNULL, close_fds=True,
-                stdout=open(BRIDGE_STDOUT_LOG, "ab"),
+                stdout=open(bridge_stdout_log_path(), "ab"),
                 stderr=subprocess.STDOUT,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         # spawn 成功 ≠ 进程活着：-m 缺 __main__ 守卫那类 bug 会让桥
@@ -240,7 +272,7 @@ def bridge_start(cfg: dict) -> tuple[bool, str]:
         time.sleep(4)
         rc = proc.poll()
         if rc is not None:
-            tail = tail_lines(BRIDGE_STDOUT_LOG, 15) or "(无输出)"
+            tail = tail_lines(bridge_stdout_log_path(), 15) or "(无输出)"
             log_line(f"bridge died instantly rc={rc}: {tail[-200:]}")
             return False, f"桥启动后 {rc} 退出：{tail[-200:]}"
         log_line(f"bridge started pid={proc.pid} exe={exe}")
@@ -381,7 +413,9 @@ def octop_home(cfg: dict) -> Path | None:
         p = Path(cfg["octop_home"])
         if p.exists():
             return p
-    p = Path.home() / ".octop"
+    # WECHATAUTO_OCTOP_HOME：测试/多实例隔离真实 ~/.octop 用
+    env = os.environ.get("WECHATAUTO_OCTOP_HOME")
+    p = Path(env) if env else Path.home() / ".octop"
     return p if p.exists() else None
 
 
@@ -659,6 +693,13 @@ def octop_group_allowlist_set(cfg: dict, ids: list[str]) -> tuple[bool, str]:
     if not cid:
         return False, "没有 wechatauto 渠道行（先注入）"
     ids = [str(x) for x in ids]
+    # 期望值持久化到 manager.json——独立于 octop.db。dashboard 保存渠道时
+    # 会整段替换 config_json 且不认识的字段会丢，watchdog 靠这份备份自愈。
+    cfg["octop_allowlist"] = sorted(ids)
+    try:
+        save_config(cfg)
+    except OSError:
+        pass
     n = len(ids)
     desc = "已关闭过滤（全部群可触发）" if not ids else f"白名单 {n} 个群"
     code, detail = octop_api(cfg, "GET", f"/agents/main/channels/{cid}")
@@ -701,8 +742,62 @@ def octop_group_allowlist_set(cfg: dict, ids: list[str]) -> tuple[bool, str]:
     return True, f"{desc}；后端离线，下次启动生效"
 
 
-#: adapter 源码金本：不依赖 dev clone 存活，注入成功时自动回写保鲜
-ADAPTER_GOLDEN = MANAGER_DIR / "adapter-src" / "wechatauto"
+def octop_allowlist_guard(cfg: dict) -> str | None:
+    """白名单漂移自愈——watchdog 周期调用，幂等。
+
+    ``group_allow`` 是我们塞进 channel config_json 的自定义字段，Octop
+    dashboard 保存渠道时整段替换 config、不认识的字段会静默丢掉。
+    期望值存在 manager.json（octop_allowlist），发现渠道 config 里的
+    group_allow 与期望不一致就重放一次（走 API 路径，自带热重载）。
+    返回修复描述；无漂移/未设过白名单返回 None。
+    """
+    home = octop_home(cfg)
+    if not home or not (home / "octop.db").exists():
+        return None
+    desired = cfg.get("octop_allowlist")
+    if not isinstance(desired, list) or not desired:
+        # bootstrap：渠道上已有 group_allow（老版本手工应用过）但
+        # manager.json 还没期望值——领养进 cfg，之后才有修复依据。
+        adopted = _channel_group_allow(home)
+        if adopted:
+            cfg["octop_allowlist"] = sorted(adopted)
+            try:
+                save_config(cfg)
+            except OSError:
+                pass
+        return None
+    current = sorted(_channel_group_allow(home))
+    want = sorted(str(x) for x in desired)
+    if current == want:
+        return None
+    ok, msg = octop_group_allowlist_set(cfg, want)
+    note = f"漂移修复 {'ok' if ok else 'failed'}: {msg}"
+    log_line(f"allowlist guard: config={current} expected={want} -> {note}")
+    return f"group_allow 漂移已修复（{len(want)} 个群）" if ok else None
+
+
+def _channel_group_allow(home: Path) -> list[str]:
+    """只读渠道 config_json 里的 group_allow（无行/无字段返回 []）。"""
+    try:
+        conn = sqlite3.connect(f"file:{home / 'octop.db'}?mode=ro", uri=True)
+        row = conn.execute(
+            "SELECT config_json FROM channels WHERE kind='wechatauto'"
+            " LIMIT 1").fetchone()
+        conn.close()
+        cj = json.loads(row[0]) if row and row[0] else {}
+        raw = cj.get("group_allow") if isinstance(cj, dict) else None
+        return [str(x) for x in raw] if isinstance(raw, list) else []
+    except (sqlite3.Error, ValueError, TypeError):
+        return []
+
+
+def adapter_golden() -> Path:
+    """adapter 源码金本：不依赖 dev clone 存活，注入成功时自动回写保鲜。"""
+    return manager_dir() / "adapter-src" / "wechatauto"
+
+
+# 兼容旧引用（测试/外部脚本可能直接读常量）
+ADAPTER_GOLDEN = adapter_golden()
 
 
 def _octop_adapter_src(cfg: dict) -> Path | None:
@@ -719,7 +814,8 @@ def _octop_adapter_src(cfg: dict) -> Path | None:
                      Path(repo).parent / "octop-gateway" / rel):
             if cand.exists():
                 return cand
-    return ADAPTER_GOLDEN if ADAPTER_GOLDEN.exists() else None
+    golden = adapter_golden()
+    return golden if golden.exists() else None
 
 
 def octop_inject_adapter(cfg: dict) -> tuple[bool, str]:
@@ -737,11 +833,12 @@ def octop_inject_adapter(cfg: dict) -> tuple[bool, str]:
     if dst.exists():
         shutil.rmtree(dst)
     shutil.copytree(src, dst)
-    if src != ADAPTER_GOLDEN:  # 用更新鲜的源回写金本
-        ADAPTER_GOLDEN.parent.mkdir(parents=True, exist_ok=True)
-        if ADAPTER_GOLDEN.exists():
-            shutil.rmtree(ADAPTER_GOLDEN)
-        shutil.copytree(src, ADAPTER_GOLDEN,
+    golden = adapter_golden()
+    if src != golden:  # 用更新鲜的源回写金本
+        golden.parent.mkdir(parents=True, exist_ok=True)
+        if golden.exists():
+            shutil.rmtree(golden)
+        shutil.copytree(src, golden,
                         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     init = pkg / "__init__.py"
     text = init.read_text(encoding="utf-8")
@@ -788,9 +885,9 @@ def openclaw_status(cfg: dict) -> dict:
 
 def log_sources(cfg: dict) -> dict[str, Path]:
     sources = {
-        "manager.log": MANAGER_LOG,
-        "bridge-fatal.log": LOG_DIR / "bridge-fatal.log",
-        "bridge-stdout.log": BRIDGE_STDOUT_LOG,
+        "manager.log": manager_log_path(),
+        "bridge-fatal.log": log_dir() / "bridge-fatal.log",
+        "bridge-stdout.log": bridge_stdout_log_path(),
     }
     home = hermes_home(cfg)
     if home:

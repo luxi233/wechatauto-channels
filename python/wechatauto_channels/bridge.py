@@ -158,15 +158,40 @@ def _json_response(handler: BaseHTTPRequestHandler, code: int, payload) -> None:
     handler.wfile.write(body)
 
 
+_DEDUP_TTL_S = 600.0   # 出站幂等窗口：消费方的失败重试必须落在窗口内
+_DEDUP_MAX = 512
+
+
 class BridgeState:
     def __init__(self, core: ChannelCore, token: str):
         self.core = core
         self.token = token
         self.buffer = EventBuffer()
         self._send_lock = threading.Lock()  # GUI 发送全局串行，避免并发抢输入框
+        # 出站幂等表：{client_msg_id: (ts, http_code, payload)}。
+        # 只存成功结果——失败不缓存，重试照常真发；成功的重复 id 直接回
+        # 缓存响应。配合消费方的"传输失败才重试"，覆盖"桥已发出但响应
+        # 没送达"的经典重复发送场景。锁与 _send_lock 复用即可。
+        self._dedup: dict[str, tuple[float, int, dict]] = {}
         # 进程级启动标识：消费方（Octop adapter 等）用它区分"桥重启了
         # （seq 归零、队列只含新事件）"和"adapter 自己重启了（应续游标）"。
         self.boot_id = uuid.uuid4().hex
+
+    def dedup_lookup(self, mid: str) -> tuple[int, dict] | None:
+        hit = self._dedup.get(mid)
+        if not hit:
+            return None
+        ts, code, payload = hit
+        if time.time() - ts > _DEDUP_TTL_S:
+            self._dedup.pop(mid, None)
+            return None
+        return code, payload
+
+    def dedup_store(self, mid: str, code: int, payload: dict) -> None:
+        self._dedup[mid] = (time.time(), code, payload)
+        if len(self._dedup) > _DEDUP_MAX:  # FIFO 驱逐最旧
+            oldest = min(self._dedup, key=lambda k: self._dedup[k][0])
+            self._dedup.pop(oldest, None)
 
 
 def make_handler(state: BridgeState):
@@ -287,6 +312,13 @@ def make_handler(state: BridgeState):
 
             # GUI 发送会操纵真实微信窗口：全局串行
             with state._send_lock:
+                mid = str(body.get("client_msg_id") or "")
+                if mid:
+                    hit = state.dedup_lookup(mid)
+                    if hit is not None:
+                        code, payload = hit
+                        return _json_response(
+                            self, code, {**payload, "deduplicated": True})
                 if path == "/send":
                     text = body.get("text") or ""
                     verify = bool(body.get("verify"))
@@ -298,14 +330,20 @@ def make_handler(state: BridgeState):
                         ok = ok and r.get("ok", False)
                         if not r.get("ok"):
                             break
-                    return _json_response(self, 200 if ok else 502,
-                                          {"ok": ok, "results": results})
+                    payload = {"ok": ok, "results": results}
+                    code = 200 if ok else 502
+                    if mid and ok:
+                        state.dedup_store(mid, code, payload)
+                    return _json_response(self, code, payload)
                 if path == "/send_file":
                     fp = body.get("path") or ""
                     r = state.core.send_file(to, fp,
                                              image=bool(body.get("image")),
                                              verify=bool(body.get("verify")))
-                    return _json_response(self, 200 if r.get("ok") else 502, r)
+                    code = 200 if r.get("ok") else 502
+                    if mid and r.get("ok"):
+                        state.dedup_store(mid, code, r)
+                    return _json_response(self, code, r)
             return _json_response(self, 404, {"ok": False, "error": "not found"})
 
     return Handler

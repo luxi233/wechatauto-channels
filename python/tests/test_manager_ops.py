@@ -5,12 +5,22 @@ import copy
 import hashlib
 import hmac
 import json
+import os
 import sqlite3
 import sys
 import tempfile
 import unittest
 from unittest import mock
 from pathlib import Path
+
+# 必须在 import manager_ops 之前设置：本模块所有路径（manager.json、
+# manager.log、adapter 金本）都经 WECHATAUTO_HOME/WECHATAUTO_LOG_DIR
+# 动态解析。不隔离的话，单测会把 hermes.enabled/group_allow 之类的
+# 假操作日志写进真实 manager.log（生产已踩过），甚至摸到真 octop.db。
+_TMP_ROOT = Path(tempfile.mkdtemp(prefix="wca-test-"))
+os.environ["WECHATAUTO_HOME"] = str(_TMP_ROOT / ".wechatauto")
+os.environ["WECHATAUTO_LOG_DIR"] = str(_TMP_ROOT / "logs")
+os.environ["WECHATAUTO_OCTOP_HOME"] = str(_TMP_ROOT / ".octop")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -174,12 +184,9 @@ class TestAutoOpenDefaults(unittest.TestCase):
         conn.close()
 
     def test_no_db_returns_empty(self):
-        import copy
+        # octop_home 不存在 → 回退 WECHATAUTO_OCTOP_HOME（模块级已指向
+        # 不存在的 tmp 路径）→ octop_home 返回 None → 空结果。
         cfg = copy.deepcopy(ops.DEFAULT_CFG | {"octop_home": "/nonexistent"})
-        # octop_home 不存在时回退 ~/.octop 探测；本机有真 octop.db 时
-        # 该用例会翻动真实库——跳过避免误伤。
-        if (Path.home() / ".octop" / "octop.db").exists():
-            self.skipTest("real octop.db present")
         self.assertEqual(ops.octop_auto_open_defaults(cfg), [])
 
 
@@ -307,6 +314,53 @@ class TestGroupAllowlist(unittest.TestCase):
             "SELECT config_json FROM channels").fetchone()[0])
         conn.close()
         self.assertEqual(cj["group_allow"], ["111@chatroom"])
+
+    def test_set_persists_desired_allowlist(self):
+        # 期望值落 manager.json——dashboard 抹掉渠道字段后靠它自愈
+        cfg = self._mk_octop(tempfile.mkdtemp())
+
+        def fake_api(_c, method, _p, body=None):
+            return (200, {"config": {}}) if method == "GET" else (200, {})
+
+        with mock.patch.object(ops, "octop_api", side_effect=fake_api):
+            ok, _ = ops.octop_group_allowlist_set(cfg, ["111@chatroom"])
+        self.assertTrue(ok)
+        disk = json.loads(ops.manager_cfg_path().read_text("utf-8"))
+        self.assertEqual(disk["octop_allowlist"], ["111@chatroom"])
+
+    def test_guard_no_drift_noop(self):
+        cfg = self._mk_octop(
+            tempfile.mkdtemp(), config={"group_allow": ["111@chatroom"]})
+        cfg["octop_allowlist"] = ["111@chatroom"]
+        with mock.patch.object(ops, "octop_api",
+                               side_effect=AssertionError("不该调用")):
+            self.assertIsNone(ops.octop_allowlist_guard(cfg))
+
+    def test_guard_restores_wiped_field(self):
+        # 渠道 config 里的 group_allow 被整段替换丢掉 → 从期望值重放
+        cfg = self._mk_octop(
+            tempfile.mkdtemp(), config={"token": "t"})  # 无 group_allow
+        cfg["octop_allowlist"] = ["111@chatroom"]
+        calls = []
+
+        def fake_api(_c, method, _p, body=None):
+            calls.append(method)
+            return (200, {"config": {"token": "t"}}) if method == "GET" \
+                else (200, {})
+
+        with mock.patch.object(ops, "octop_api", side_effect=fake_api):
+            note = ops.octop_allowlist_guard(cfg)
+        self.assertIsNotNone(note)
+        self.assertIn("PATCH", calls)
+
+    def test_guard_bootstraps_existing_allowlist(self):
+        # 老部署：渠道有 group_allow 但 manager.json 没期望值 → 领养不修复
+        cfg = self._mk_octop(
+            tempfile.mkdtemp(), config={"group_allow": ["g@chatroom"]})
+        with mock.patch.object(ops, "octop_api",
+                               side_effect=AssertionError("不该调用")):
+            self.assertIsNone(ops.octop_allowlist_guard(cfg))
+        self.assertEqual(cfg["octop_allowlist"], ["g@chatroom"])
 
 
 class TestConfigRoundTrip(unittest.TestCase):

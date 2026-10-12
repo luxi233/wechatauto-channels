@@ -224,6 +224,57 @@ class TestBridgeE2E(unittest.TestCase):
         code, _ = _req(self.port, "GET", "/context")
         self.assertEqual(code, 400)
 
+    # ── 出站幂等：client_msg_id 去重窗口 ──────────────────────────────
+    def test_10_send_dedup_client_msg_id(self):
+        _sent.clear()
+        body = {"to": "好友甲", "text": "幂等测试",
+                "client_msg_id": "mid-e2e-dedup"}
+        code, r1 = _req(self.port, "POST", "/send", body)
+        self.assertEqual(code, 200)
+        self.assertTrue(r1["ok"])
+        code, r2 = _req(self.port, "POST", "/send", body)
+        self.assertEqual(code, 200)
+        self.assertTrue(r2["deduplicated"])
+        # 第二次命中缓存——底层 send_msg 只被真正调用一次
+        self.assertEqual(_sent, [("text", "好友甲", "幂等测试")])
+
+    def test_11_send_failure_not_deduped(self):
+        # 失败结果不缓存：重试必须真发，否则一次 502 永久吞掉该消息
+        body = {"to": "不存在的人", "text": "x", "client_msg_id": "mid-fail"}
+        code1, _ = _req(self.port, "POST", "/send", body)
+        self.assertEqual(code1, 502)
+        code2, r2 = _req(self.port, "POST", "/send", body)
+        self.assertEqual(code2, 502)
+        self.assertNotIn("deduplicated", r2)
+
+
+class TestBridgeDedupUnit(unittest.TestCase):
+    """幂等表纯逻辑——不起 server、不占实例锁，任何机器都能跑。"""
+
+    def _state(self):
+        return bridge_mod.BridgeState(core=None, token="t")
+
+    def test_lookup_hit_returns_cached(self):
+        st = self._state()
+        st.dedup_store("m1", 200, {"ok": True, "results": []})
+        self.assertEqual(st.dedup_lookup("m1"), (200, {"ok": True,
+                                                      "results": []}))
+
+    def test_lookup_miss_and_expiry(self):
+        st = self._state()
+        self.assertIsNone(st.dedup_lookup("nope"))
+        st.dedup_store("old", 200, {"ok": True})
+        # 手动把记录时间戳推到 TTL 之外
+        mid, ts, payload = "old", time.time() - 700, {"ok": True}
+        st._dedup[mid] = (ts, 200, payload)
+        self.assertIsNone(st.dedup_lookup("old"))
+
+    def test_eviction_caps_size(self):
+        st = self._state()
+        for i in range(bridge_mod._DEDUP_MAX + 10):
+            st.dedup_store(f"m{i}", 200, {"ok": True})
+        self.assertLessEqual(len(st._dedup), bridge_mod._DEDUP_MAX)
+
 
 if __name__ == "__main__":
     unittest.main()
