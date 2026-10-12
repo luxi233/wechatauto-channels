@@ -363,6 +363,50 @@ class TestGroupAllowlist(unittest.TestCase):
         self.assertEqual(cfg["octop_allowlist"], ["g@chatroom"])
 
 
+class TestSendFilePatch(unittest.TestCase):
+    """send_file_to_user 越界补丁：升级覆盖后 watchdog 应能重打。"""
+
+    def _mk(self, tmp, body=None):
+        home = Path(tmp) / "octop"
+        target = (home / "portable" / "packages" / "octop_harness"
+                  / "builtin" / "tools" / "send_file.py")
+        cfg = copy.deepcopy(ops.DEFAULT_CFG | {"octop_home": str(home)})
+        if body is not None:
+            target.parent.mkdir(parents=True)
+            target.write_text(body, encoding="utf-8")
+        return cfg, target
+
+    def test_applies_patch_when_missing(self):
+        cfg, target = self._mk(
+            tempfile.mkdtemp(),
+            "from langchain_core.tools import ToolException, tool\n"
+            "        local = workspace.materialize_local(file_path)\n")
+        self.assertIsNotNone(ops.octop_send_file_patch(cfg))
+        text = target.read_text(encoding="utf-8")
+        self.assertIn("PATCH(local)", text)
+        self.assertIn("raise ToolException(", text)
+        self.assertIn("workspace.materialize_local", text)
+
+    def test_idempotent_when_marker_present(self):
+        cfg, target = self._mk(
+            tempfile.mkdtemp(), "        local = "
+            "workspace.materialize_local(file_path)\n")
+        ops.octop_send_file_patch(cfg)
+        before = target.read_text(encoding="utf-8")
+        self.assertIsNone(ops.octop_send_file_patch(cfg))
+        self.assertEqual(target.read_text(encoding="utf-8"), before)
+
+    def test_anchor_mismatch_leaves_file_untouched(self):
+        cfg, target = self._mk(tempfile.mkdtemp(), "# upstream rewrote\n")
+        self.assertIsNone(ops.octop_send_file_patch(cfg))
+        self.assertEqual(target.read_text(encoding="utf-8"),
+                         "# upstream rewrote\n")
+
+    def test_missing_file_returns_none(self):
+        cfg, _ = self._mk(tempfile.mkdtemp(), body=None)
+        self.assertIsNone(ops.octop_send_file_patch(cfg))
+
+
 class TestConfigRoundTrip(unittest.TestCase):
     def test_defaults(self):
         cfg = ops.load_config()

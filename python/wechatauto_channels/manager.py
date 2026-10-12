@@ -378,6 +378,9 @@ class ManagerApp(tk.Tk):
         st = ops.octop_status(self.cfg)
         if not (st["installed"] and st["channel_row"]):
             return
+        note = ops.octop_send_file_patch(self.cfg)
+        if note:
+            ops.log_line(f"watchdog patch: {note}")
         if st["adapter_files"] and st["registered"]:
             return
         if now - self._last_reinject < 600:

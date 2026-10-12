@@ -791,6 +791,50 @@ def _channel_group_allow(home: Path) -> list[str]:
         return []
 
 
+# Octop 升级会整体覆盖 portable 包——本地补丁和注入的 adapter 一样会被抹。
+# send_file_to_user 越界补丁：上游把 workspace 外的绝对路径抛 PermissionError
+# 穿透 langgraph 杀掉整轮（生产实锤"一直处理出错"），降级为 ToolException
+# 让模型读错误文本自纠。marker 幂等，watchdog 周期核查、丢了就重打。
+_SEND_FILE_PATCH_MARKER = "PATCH(local)"
+_SEND_FILE_PATCH_ANCHOR = (
+    "        local = workspace.materialize_local(file_path)\n")
+_SEND_FILE_PATCH_BLOCK = (
+    "        try:\n"
+    "            local = workspace.materialize_local(file_path)\n"
+    "        except (PermissionError, ValueError) as exc:\n"
+    "            # PATCH(local): 越界路径此前会让 PermissionError 穿透 langgraph\n"
+    "            # 杀掉整轮 stream（用户端只见\"处理出错\"）。降级为 ToolException：\n"
+    "            # 模型读到错误文本后可自行把文件拷进工作区再试。\n"
+    "            raise ToolException(\n"
+    "                f\"send_file_to_user: {exc}. Copy the file into the \"\n"
+    "                \"workspace first, then retry with the workspace path.\"\n"
+    "            ) from exc\n")
+
+
+def octop_send_file_patch(cfg: dict) -> str | None:
+    """send_file_to_user 越界补丁存活检查，缺失则重打。返回动作描述或 None。"""
+    home = octop_home(cfg)
+    if not home:
+        return None
+    target = (home / "portable" / "packages" / "octop_harness"
+              / "builtin" / "tools" / "send_file.py")
+    if not target.exists():
+        return None
+    text = target.read_text(encoding="utf-8")
+    if _SEND_FILE_PATCH_MARKER in text:
+        return None
+    if _SEND_FILE_PATCH_ANCHOR not in text:
+        log_line("send_file patch: 锚点代码不匹配（上游已改版？）——人工核查")
+        return None
+    target.write_text(
+        text.replace(_SEND_FILE_PATCH_ANCHOR, _SEND_FILE_PATCH_BLOCK, 1),
+        encoding="utf-8")
+    for stale in (target.parent / "__pycache__").glob("send_file*.pyc"):
+        stale.unlink(missing_ok=True)
+    log_line("send_file patch: 越界降级补丁已（重新）应用，后端重启后生效")
+    return "send_file_to_user 越界补丁已重打（下次后端重启生效）"
+
+
 def adapter_golden() -> Path:
     """adapter 源码金本：不依赖 dev clone 存活，注入成功时自动回写保鲜。"""
     return manager_dir() / "adapter-src" / "wechatauto"
