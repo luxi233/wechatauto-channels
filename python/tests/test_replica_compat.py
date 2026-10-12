@@ -252,6 +252,212 @@ class TestOpenRetryPatch:
         assert rc.patch_open_transient_retry(mod) == "skipped:unrecognized shape"
 
 
+# ── 文件粘贴验证补丁 ──────────────────────────────────────────────────
+
+
+def _fake_guia_module(paste_style: str = "buggy"):
+    """构造带 WeChatGUI 的假 guia 模块。
+
+    buggy : _paste_attachment_and_send 是上游缺陷形态（无草稿检测、
+            无 click_send 兜底）
+    fixed : 上游已验证草稿（含 _input_box_has_text）
+    alien : 形态不认识
+    """
+    mod = types.ModuleType("fake_wechatauto_guia")
+    mod.VK_A = 0x41
+    mod.VK_DELETE = 0x2E
+    mod.VK_V = 0x56
+    mod.VK_RETURN = 0x0D
+
+    class _Input:
+        def __init__(self, gui):
+            self.gui = gui
+            self.clicks = []
+            self.keys = []
+
+        def send_input_click(self, x, y):
+            self.clicks.append((x, y))
+            self.gui.focused = True
+
+        def key(self, vk, ctrl=False, shift=False):
+            self.keys.append(vk)
+            g = self.gui
+            if vk == mod.VK_V and g.focused and g.paste_works:
+                g.button_enabled = True   # 粘贴产生草稿 → 发送按钮转绿
+            if vk == mod.VK_RETURN and g.button_enabled and g.enter_works:
+                g.button_enabled = False  # 回车消费草稿 → 按钮转灰
+
+    class WeChatGUI:
+        origin_x = 100
+        origin_y = 50
+        send_button_region = (0, 0, 100, 40)
+
+        def __init__(self):
+            self._input = _Input(self)
+            self.clipboard_calls = 0
+            self.draft_results = []
+            self.ocr_calls = 0
+            self.ocr_results = []
+            self.wx_clicks = []
+            self.focused = False
+            self.button_enabled = False
+            self.paste_works = True
+            self.enter_works = True
+            self.ocr_click_works = True
+
+        def _grab_screen(self, rect):
+            """按 button_enabled 返回全绿/全灰假图像，喂给真实的
+            _wac_send_button_enabled 像素判定。"""
+            color = (0, 200, 0) if self.button_enabled else (200, 200, 200)
+
+            class _Img:
+                size = (10, 10)
+
+                def load(self):
+                    return {(x, y): color
+                            for y in range(10) for x in range(10)}
+
+            return _Img()
+
+        def _rel_to_screen(self, rel):
+            return rel
+
+        def get_input_box(self):
+            return (10, 20, 210, 120)
+
+        def copy_files_to_clipboard(self, paths):
+            self.clipboard_calls += 1
+            return True
+
+        def _input_box_has_color_draft(self, box=None, wait=6.0):
+            return self.draft_results.pop(0) if self.draft_results else False
+
+        def ocr(self, region):
+            self.ocr_calls += 1
+            return self.ocr_results
+
+        def wx_click(self, x, y):
+            self.wx_clicks.append((x, y))
+            if self.ocr_click_works and self.button_enabled:
+                self.button_enabled = False  # 按钮点击消费草稿
+
+    if paste_style == "buggy":
+        def _paste_attachment_and_send(self, path, box=None):
+            if box is None:
+                box = self.get_input_box()
+            for _ in range(3):
+                if not self.copy_files_to_clipboard([path]):
+                    return False
+                if path.endswith(".png"):
+                    if self._input_box_has_color_draft(box):
+                        break
+            return True
+    elif paste_style == "fixed":
+        def _paste_attachment_and_send(self, path, box=None):
+            if self._input_box_has_text(box):
+                return self.click_send()
+            return False
+    else:
+        def _paste_attachment_and_send(self, path, box=None):
+            return "alien"
+
+    WeChatGUI._paste_attachment_and_send = _paste_attachment_and_send
+    mod.WeChatGUI = WeChatGUI
+    return mod
+
+
+class TestFilePastePatch:
+    def test_buggy_shape_patched(self):
+        mod = _fake_guia_module("buggy")
+        assert rc.patch_file_paste_verified(mod) == "applied"
+
+    def test_upstream_fixed_skipped(self):
+        mod = _fake_guia_module("fixed")
+        assert rc.patch_file_paste_verified(mod).startswith("skipped")
+
+    def test_alien_shape_skipped(self):
+        mod = _fake_guia_module("alien")
+        assert rc.patch_file_paste_verified(mod) == "skipped:unrecognized shape"
+
+    def test_paste_swallowed_returns_false_never_enters(self, tmp_path):
+        """粘贴被吞（草稿不出现）→ 3 次重试后诚实 False，不按回车。"""
+        mod = _fake_guia_module("buggy")
+        rc.patch_file_paste_verified(mod)
+        gui = mod.WeChatGUI()
+        gui.paste_works = False  # 粘贴永远被吞：按钮不变绿
+        f = tmp_path / "a.pdf"
+        f.write_bytes(b"x")
+        # _wait_send_button 内部有时间等待——把 sleep 打薄
+        import wechatauto_channels.replica_compat as _rc
+        orig_sleep = _rc.time.sleep
+        _rc.time.sleep = lambda s: None
+        try:
+            assert gui._paste_attachment_and_send(str(f)) is False
+        finally:
+            _rc.time.sleep = orig_sleep
+        assert gui.clipboard_calls == 3
+        assert mod.VK_RETURN not in gui._input.keys
+
+    def test_happy_path_paste_enter_sends(self, tmp_path):
+        """粘贴出草稿 + 回车发送 → True，且用中心点击聚焦。"""
+        mod = _fake_guia_module("buggy")
+        rc.patch_file_paste_verified(mod)
+        gui = mod.WeChatGUI()
+        f = tmp_path / "a.pdf"
+        f.write_bytes(b"x")
+        orig_sleep = rc.time.sleep
+        rc.time.sleep = lambda s: None
+        try:
+            assert gui._paste_attachment_and_send(str(f)) is True
+        finally:
+            rc.time.sleep = orig_sleep
+        # box (10,20,210,120) 中心 rel (110,70) → screen (210,120)
+        assert gui._input.clicks[0] == (210, 120)
+        assert mod.VK_RETURN in gui._input.keys
+
+    def test_enter_fails_ocr_button_fallback(self, tmp_path):
+        """回车发不出 → OCR 定位「发送」按钮点击兜底。"""
+        mod = _fake_guia_module("buggy")
+        rc.patch_file_paste_verified(mod)
+        gui = mod.WeChatGUI()
+        gui.enter_works = False  # 回车不生效
+        gui.ocr_results = [("发送", 50, 10, 40, 20)]
+        f = tmp_path / "a.pdf"
+        f.write_bytes(b"x")
+        orig_sleep = rc.time.sleep
+        rc.time.sleep = lambda s: None
+        try:
+            assert gui._paste_attachment_and_send(str(f)) is True
+        finally:
+            rc.time.sleep = orig_sleep
+        assert gui.ocr_calls >= 1
+        assert gui.wx_clicks  # OCR 按钮被点了
+
+    def test_send_never_confirmed_returns_false(self, tmp_path):
+        """草稿在但回车/按钮都发不出 → False。"""
+        mod = _fake_guia_module("buggy")
+        rc.patch_file_paste_verified(mod)
+        gui = mod.WeChatGUI()
+        gui.enter_works = False
+        gui.ocr_click_works = False
+        gui.ocr_results = [("发送", 50, 10, 40, 20)]
+        f = tmp_path / "a.pdf"
+        f.write_bytes(b"x")
+        orig_sleep = rc.time.sleep
+        rc.time.sleep = lambda s: None
+        try:
+            assert gui._paste_attachment_and_send(str(f)) is False
+        finally:
+            rc.time.sleep = orig_sleep
+
+    def test_missing_file_returns_false(self):
+        mod = _fake_guia_module("buggy")
+        rc.patch_file_paste_verified(mod)
+        gui = mod.WeChatGUI()
+        assert gui._paste_attachment_and_send("/nonexistent/x.pdf") is False
+        assert gui.clipboard_calls == 0
+
+
 # ── apply_replica_patches 装配 ───────────────────────────────────────
 
 

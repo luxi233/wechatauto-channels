@@ -219,6 +219,161 @@ def patch_open_transient_retry(db_module: Any) -> str:
     return _APPLIED[name]
 
 
+def patch_file_paste_verified(guia_module: Any) -> str:
+    """修 ``WeChatGUI._paste_attachment_and_send`` 的静默假成功。
+
+    上游缺陷有两层（2026-10-12 实锤，M1说明书.pdf 两次"已发送"均未落库）：
+
+    1. ``focus_input`` 点击点在 ``y0 + min(24, h//4)``——贴探测框上沿。
+       探测框上沿比真实输入框高几个像素时，点击落到消息区，输入框从未
+       获得焦点，Ctrl+V 的文件粘贴被微信 4.x 静默吞掉（不弹任何错误）。
+    2. 非图片分支**不验证草稿**：粘贴后 sleep 2s 盲按回车、无条件返回
+       True——对空输入框按回车等于没发，链路却一路报"已发送"。
+
+    补丁：①改用 ``send_input_click`` 点输入框**中心**（实测稳定聚焦）；
+    ②文件草稿用 ``_input_box_has_text`` 检测（文件卡片文件名是深色文字，
+    命中其深色像素阈值），未就绪重试粘贴；③发送复用 ``click_send``
+    （回车→验证清空→OCR「发送」按钮兜底）；④草稿始终未出现返回
+    False——宁可报真实失败也不报假成功。
+    """
+    name = "file_paste_verified"
+    cls = getattr(guia_module, "WeChatGUI", None)
+    original = getattr(cls, "_paste_attachment_and_send", None) if cls else None
+    if original is None:
+        _record(name, "skipped:no _paste_attachment_and_send")
+        return _APPLIED[name]
+    if getattr(original, "_wac_safe", False):
+        _record(name, "skipped:already patched")
+        return _APPLIED[name]
+    src = _src(original)
+    if "_input_box_has_text" in src or "click_send" in src:
+        _record(name, "skipped:upstream already verifies")
+        return _APPLIED[name]
+    if "copy_files_to_clipboard" not in src or "_input_box_has_color_draft" not in src:
+        _record(name, "skipped:unrecognized shape")
+        return _APPLIED[name]
+
+    import os
+
+    wxlog = getattr(guia_module, "wxlog", _LOG)
+    rhythm = getattr(guia_module, "rhythm", None)
+    VK_A = getattr(guia_module, "VK_A", 0x41)
+    VK_DELETE = getattr(guia_module, "VK_DELETE", 0x2E)
+    VK_V = getattr(guia_module, "VK_V", 0x56)
+    VK_RETURN = getattr(guia_module, "VK_RETURN", 0x0D)
+
+    def _send_button_enabled(self: Any) -> bool:
+        """「发送」按钮变绿 = 存在可发送草稿；灰色 = 输入框为空。
+
+        比 ``_input_box_has_text`` 可靠：后者按深色像素计数，会被空输入
+        框里闪烁的光标和消息区溢出像素打成假阳性（2026-10-12 实锤：
+        文件已发出但 click_send 凭它误判"草稿仍在"返回 False）。
+        """
+        try:
+            x0, y0, x1, y1 = self.send_button_region
+            img = self._grab_screen(self._rel_to_screen((x0, y0, x1, y1)))
+            px = img.load()
+            green = 0
+            for yy in range(0, img.size[1], 2):
+                for xx in range(0, img.size[0], 2):
+                    r, g, b = px[xx, yy][:3]
+                    if g > 140 and r < 100 and b < 140:
+                        green += 1
+            return green > 20
+        except Exception:  # noqa: BLE001 - 截图失败按"不可用"处理
+            return False
+
+    def _wait_send_button(self: Any, enabled: bool, wait: float) -> bool:
+        deadline = time.time() + wait
+        while time.time() < deadline:
+            if self._wac_send_button_enabled() == enabled:
+                return True
+            time.sleep(0.4)
+        return False
+
+    def _paste_attachment_and_send(self: Any, path: str,
+                                   box: Any = None) -> bool:
+        if not os.path.isfile(path):
+            wxlog.debug(f'文件不存在：{path}')
+            return False
+        is_image = path.lower().endswith(
+            ('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp'))
+        if box is None:
+            box = self.get_input_box()
+        wxlog.debug(f'粘贴前输入框探测：{box}')
+        if not box:
+            return False
+        x0, y0, x1, y1 = box
+        draft_ok = False
+        for attempt in range(3):
+            # 输入框中心真实点击聚焦。上游 focus_input 点 y0+24 顶边，
+            # 探测框上沿偏高几像素就落到消息区——文件粘贴随之被吞。
+            self._input.send_input_click(
+                self.origin_x + (x0 + x1) // 2,
+                self.origin_y + (y0 + y1) // 2)
+            time.sleep(0.5)
+            if not self.copy_files_to_clipboard([path]):
+                return False
+            time.sleep(0.3)
+            self._input.key(VK_A, ctrl=True)
+            self._input.key(VK_DELETE)
+            self._input.key(VK_V, ctrl=True)
+            if is_image:
+                draft_ok = self._input_box_has_color_draft(box, wait=6.0)
+            else:
+                # 文件草稿 = 「发送」按钮转绿。光标/消息区都不会点亮它，
+                # 比数深色像素干净。
+                draft_ok = _wait_send_button(self, True, 5.0)
+            wxlog.debug(f'粘贴尝试 {attempt + 1} 草稿检测：{draft_ok}')
+            if draft_ok:
+                break
+        if not draft_ok:
+            # 上游原行为是仍然盲按回车并返回 True（假成功）。这里必须
+            # 诚实失败，让 send_file / 桥 / adapter 层层报真实错误。
+            wxlog.warning(
+                f'附件粘贴未检测到草稿（{os.path.basename(path)}），放弃发送')
+            return False
+        # 发送：回车 → 按钮转灰（草稿被消费）才算发出；未转灰则
+        # OCR 定位「发送」按钮点击兜底。全程不碰 _input_box_has_text。
+        for attempt in range(3):
+            if rhythm is not None:
+                rhythm.gate('send-file')
+            self._input.key(VK_RETURN)
+            if _wait_send_button(self, False, 2.0):
+                return True
+            wxlog.debug(f'回车后发送按钮仍可用（attempt={attempt}），改用按钮点击')
+            try:
+                res = self.ocr(self.send_button_region)
+            except Exception:  # noqa: BLE001
+                res = []
+            clicked = False
+            for text, ox, oy, ow, oh in res:
+                if '发送' in (text or ''):
+                    px_, py_ = (self.origin_x + ox + ow // 2,
+                                self.origin_y + oy + oh // 2)
+                    if rhythm is not None:
+                        px_, py_ = rhythm.point((self.origin_x + ox,
+                                                 self.origin_y + oy,
+                                                 self.origin_x + ox + ow,
+                                                 self.origin_y + oy + oh))
+                    self.wx_click(px_, py_)
+                    clicked = True
+                    break
+            if not clicked:
+                # 按钮区域 OCR 不到「发送」——可能已被消费/布局异常，
+                # 以按钮灰态再确认一次收尾。
+                return not self._wac_send_button_enabled()
+            if _wait_send_button(self, False, 2.0):
+                return True
+        return False
+
+    _paste_attachment_and_send._wac_safe = True  # type: ignore[attr-defined]
+    cls._paste_attachment_and_send = _paste_attachment_and_send
+    cls._wac_send_button_enabled = _send_button_enabled
+    _record(name, "applied")
+    return _APPLIED[name]
+
+
 def apply_replica_patches() -> Dict[str, str]:
     """对进程内的 wechatauto-replica 应用全部已知缺陷补丁。幂等。
 
@@ -236,10 +391,17 @@ def apply_replica_patches() -> Dict[str, str]:
     except Exception:
         logger_module = None
 
+    try:
+        import wechatauto.guia as guia_module  # type: ignore
+    except Exception:
+        guia_module = None
+
     if logger_module is not None:
         patch_logger_file_handler(logger_module)
     patch_get_self_info_close(db_module)
     patch_open_transient_retry(db_module)
+    if guia_module is not None:
+        patch_file_paste_verified(guia_module)
     _LOG.info("replica compat patches: %s", _APPLIED)
     return dict(_APPLIED)
 
