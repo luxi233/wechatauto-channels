@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import importlib.util
 import json
 import os
 import re
@@ -824,6 +825,23 @@ _SEND_FILE_DOC_BLOCK = (
     "        group chats alike; in a group it is posted into that group.\n")
 
 
+def _load_vendored_harness_patches(home: Path):
+    """补丁块单一事实源是 adapter 包内的 _harness_patches.py（随渠道注入
+    分发、import 时自应用）。watchdog 复用同一份代码做周期核查——下面
+    的内嵌常量只是旧部署缺该文件时的回退。"""
+    p = (home / "portable" / "packages" / "octop_gateway" / "channels"
+         / "wechatauto" / "_harness_patches.py")
+    if not p.exists():
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location("wca_harness_patches", p)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def octop_send_file_patch(cfg: dict) -> str | None:
     """send_file_to_user 补丁存活检查（越界降级 + 群语义），缺失则重打。"""
     home = octop_home(cfg)
@@ -833,6 +851,12 @@ def octop_send_file_patch(cfg: dict) -> str | None:
               / "builtin" / "tools" / "send_file.py")
     if not target.exists():
         return None
+    mod = _load_vendored_harness_patches(home)
+    if mod is not None:
+        desc = mod.apply(target=target, log=log_line)
+        if not desc:
+            return None
+        return f"send_file_to_user {desc}补丁已重打（下次后端重启生效）"
     text = target.read_text(encoding="utf-8")
     applied: list[str] = []
     if _SEND_FILE_PATCH_MARKER not in text:
