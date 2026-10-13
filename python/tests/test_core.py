@@ -466,5 +466,57 @@ class TestRecentContext(unittest.TestCase):
         self.assertEqual(p, "x/wxid_friend_42.jpg")
 
 
+class TestSendVerifySoftConfirm(unittest.TestCase):
+    """verify 回读只产出 confirmed 软信号——UIA 成功即 ok:true。
+
+    2026-10-13 群聊实测：DB 回读被 WAL 合并饿死 → 误报硬失败 →
+    消费方中止出站队列并把兜底错误文案发进群。"""
+
+    class _Gui:
+        def __init__(self, status="成功"):
+            self._status = status
+
+        def send_msg(self, text, who=None, verify=False):
+            return {"status": self._status, "message": "ok"}
+
+        def send_file(self, path, who=None, verify=False):
+            return {"status": self._status, "message": "ok"}
+
+    def _core(self, gui_status="成功", verify_result=False):
+        core = make_core()
+        core._gui = lambda: self._Gui(gui_status)  # noqa: SLF001
+        core._verify_sent = lambda *a, **k: verify_result  # noqa: SLF001
+        return core
+
+    def test_unconfirmed_is_soft_success(self):
+        core = self._core(verify_result=False)
+        r = core.send_text("wxid_friend", "hi", verify=True)
+        self.assertTrue(r["ok"])
+        self.assertFalse(r["confirmed"])
+
+    def test_confirmed_flag_on_success(self):
+        core = self._core(verify_result=True)
+        r = core.send_text("wxid_friend", "hi", verify=True)
+        self.assertTrue(r["ok"])
+        self.assertTrue(r["confirmed"])
+
+    def test_file_unconfirmed_is_soft_success(self):
+        core = self._core(verify_result=False)
+        r = core.send_file("wxid_friend", "x.pdf", verify=True)
+        self.assertTrue(r["ok"])
+        self.assertFalse(r["confirmed"])
+
+    def test_uia_failure_still_hard_fail(self):
+        core = self._core(gui_status="失败")
+        r = core.send_text("wxid_friend", "hi", verify=True)
+        self.assertFalse(r["ok"])
+
+    def test_no_verify_no_confirmed_key(self):
+        core = self._core()
+        r = core.send_text("wxid_friend", "hi", verify=False)
+        self.assertTrue(r["ok"])
+        self.assertNotIn("confirmed", r)
+
+
 if __name__ == "__main__":
     unittest.main()

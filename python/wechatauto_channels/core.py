@@ -575,9 +575,16 @@ class ChannelCore:
         # .agents/notes/implemented/bug-fix/2026-10-07-hermes-v0.21-compat.md
         ok = str(resp.get("status", "")) in ("成功", "success")
         if ok and verify:
-            ok = self._verify_sent(username, text, mark)
-            return {"ok": ok,
-                    "message": "已发送并确认" if ok else "已发送但数据库未确认",
+            # 回读确认只做软信号：微信侧异步落库 + WAL 合并被写锁饿死时，
+            # 已送达的消息在超时窗口内读不到是必然事件，不能当失败上抛——
+            # 否则消费方会中止整个出站队列并向用户推错误兜底文案
+            # （2026-10-13 群聊实测：文本送达→verify 误报→文件事件被丢弃）。
+            confirmed = self._verify_sent(username, text, mark)
+            if not confirmed:
+                logger.warning(
+                    "send_text verify: UIA 已送达但 DB 回读未确认 to=%s", username)
+            return {"ok": True, "confirmed": confirmed,
+                    "message": "已发送并确认" if confirmed else "已发送（回读未确认）",
                     "to": username}
         return {"ok": ok, "message": resp.get("message"), "to": username}
 
@@ -594,9 +601,12 @@ class ChannelCore:
         # WxResponse.status 是中文（成功/失败/错误），兼容英文取值
         ok = str(resp.get("status", "")) in ("成功", "success")
         if ok and verify:
-            ok = self._verify_sent(username, None, mark)
-            return {"ok": ok,
-                    "message": "已发送并确认" if ok else "已发送但数据库未确认",
+            confirmed = self._verify_sent(username, None, mark)
+            if not confirmed:
+                logger.warning(
+                    "send_file verify: UIA 已送达但 DB 回读未确认 to=%s", username)
+            return {"ok": True, "confirmed": confirmed,
+                    "message": "已发送并确认" if confirmed else "已发送（回读未确认）",
                     "to": username}
         return {"ok": ok, "message": resp.get("message"), "to": username}
 
