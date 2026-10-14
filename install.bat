@@ -43,9 +43,16 @@ goto install
 :make_venv
 set "SEED="
 if exist "%OCTOP_PY%" set "SEED=%OCTOP_PY%"
+rem winsdk (dep of wechatauto-replica) ships wheels only for cp39-cp312;
+rem on 3.13+ pip falls back to an MSVC source build that dies on
+rem non-ASCII user profile paths -> always prefer a <=3.12 interpreter.
 if not defined SEED (
-  where py >nul 2>nul
-  if not errorlevel 1 set "SEED=py -3"
+  for %%V in (3.12 3.11 3.10) do (
+    if not defined SEED (
+      py -%%V --version >nul 2>nul
+      if not errorlevel 1 set "SEED=py -%%V"
+    )
+  )
 )
 if not defined SEED (
   where python >nul 2>nul
@@ -53,7 +60,7 @@ if not defined SEED (
 )
 if not defined SEED (
   echo [wechatauto] ERROR: no Python found. Install Octop, Hermes,
-  echo   or Python 3.9+ first, then re-run install.bat
+  echo   or Python 3.12 first, then re-run install.bat
   exit /b 1
 )
 echo [wechatauto] creating venv %VENV% from: %SEED%
@@ -65,10 +72,19 @@ if errorlevel 1 (
 set "TARGET=%VENV%\Scripts\python.exe"
 
 :install
+rem winsdk has no cp313+ wheels; refuse a >3.12 target early instead of
+rem letting pip wander into a doomed source build.
+"%TARGET%" -c "import sys; raise SystemExit(0 if sys.version_info[:2] <= (3, 12) else 1)"
+if errorlevel 1 (
+  echo [wechatauto] ERROR: %TARGET% is Python 3.13+, but winsdk
+  echo   ships wheels only for Python 3.9-3.12. Install Python 3.12
+  echo   (or Hermes/Octop, which bundle a compatible runtime), then re-run.
+  exit /b 1
+)
 echo [wechatauto] installing package into: %TARGET%
 "%TARGET%" -m pip --version >nul 2>nul
 if errorlevel 1 "%TARGET%" -m ensurepip --upgrade >nul 2>nul
-"%TARGET%" -m pip install --upgrade "%ROOT%python[send-ocr]"
+"%TARGET%" -m pip install --upgrade "%ROOT%python[send-ocr]" --only-binary winsdk
 if errorlevel 1 (
   echo [wechatauto] ERROR: pip install failed
   exit /b 1
