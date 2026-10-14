@@ -892,6 +892,335 @@ def adapter_golden() -> Path:
 ADAPTER_GOLDEN = adapter_golden()
 
 
+# ---------------------------------------------------------------------------
+# Octop 一键接入：前端补丁 + 建行 + 重启验证
+# ---------------------------------------------------------------------------
+
+
+def _fe_block_end(js: str, start: int) -> int:
+    """js[start] 是 [ 或 {，返回匹配闭合符下标（跳过字符串字面量）。"""
+    open_c = js[start]
+    close_c = "]" if open_c == "[" else "}"
+    depth, i, quote = 0, start, ""
+    while i < len(js):
+        c = js[i]
+        if quote:
+            if c == "\\":
+                i += 1
+            elif c == quote:
+                quote = ""
+        elif c in "\"'`":
+            quote = c
+        elif c == open_c:
+            depth += 1
+        elif c == close_c:
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def _fe_ensure(js: str, var: str, member: str, at_start: bool) -> str:
+    """往 var={...}/[...] 结构里补 member（幂等：body 里已有 wechatauto 跳过）。"""
+    m = re.search(rf"(?<![\w$]){var}\s*=", js)
+    if not m:
+        return js
+    open_at = m.end()
+    while open_at < len(js) and js[open_at] in " \t":
+        open_at += 1
+    if open_at >= len(js) or js[open_at] not in "[{":
+        return js
+    end = _fe_block_end(js, open_at)
+    if end < 0:
+        return js
+    body = js[open_at + 1:end]
+    if "wechatauto" in body:
+        return js
+    if at_start:
+        return js[:open_at + 1] + member + "," + body + js[end:]
+    return js[:end] + body + "," + member + js[end:]
+
+
+# (变量名, 成员文本, 插在开头?) —— 与当前已打补丁的生产 index.*.js 逐字节对齐。
+_FE_MEMBERS = [
+    ("CHANNEL_KEYS", '"wechatauto"', False),
+    ("CHANNEL_LABEL_KEYS", 'wechatauto:"channels.label_wechatauto"', True),
+    ("CHANNEL_LABELS", 'wechatauto:"微信Auto"', True),
+    ("CHANNEL_ICONS", "wechatauto:weixinIcon", True),
+    ("CHANNEL_URLS",
+     'wechatauto:"https://github.com/luxi233/wechatauto-channels"', True),
+]
+
+# 渠道字段 schema：插在 mqtt 渠道定义前。
+_FE_FIELDS_ANCHOR = 'mqtt:[{name:"host"'
+_FE_FIELDS_BLOCK = (
+    'wechatauto:[{name:"base_url",label:"Bridge URL",'
+    'placeholder:"http://127.0.0.1:18765"},'
+    '{name:"token",label:"Bridge Token",type:"password",required:!0},'
+    '{name:"poll_timeout_ms",label:"Poll Timeout (ms)",placeholder:"30000"},'
+    '{name:"verify_send",label:"Verify Send",type:"switch"}],'
+    + _FE_FIELDS_ANCHOR)
+
+
+def octop_patch_frontend(cfg: dict) -> tuple[bool, str]:
+    """给 dashboard bundle 打 wechatauto 渠道卡片补丁（幂等逐锚点）。
+
+    Octop 升级会换掉 index.*.js 文件名并重置内容——本函数同时被
+    「一键接入」和 watchdog 巡检调用，锚点缺失只告警不硬错。"""
+    home = octop_home(cfg)
+    if not home:
+        return False, "未检测到 Octop"
+    assets = home / "portable" / "packages" / "octop" / "dashboard" / "assets"
+    targets = [p for p in assets.glob("index.*.js")] if assets.is_dir() else []
+    if not targets:
+        return False, "dashboard assets 里没有 index.*.js"
+    applied, missing = [], []
+    for js_path in targets:
+        js = js_path.read_text(encoding="utf-8", errors="replace")
+        orig = js
+        for var, member, at_start in _FE_MEMBERS:
+            js = _fe_ensure(js, var, member, at_start)
+        if _FE_FIELDS_ANCHOR in js and 'wechatauto:[{name:"base_url"' not in js:
+            js = js.replace(_FE_FIELDS_ANCHOR, _FE_FIELDS_BLOCK, 1)
+        if js != orig:
+            js_path.write_text(js, encoding="utf-8")
+            applied.append(js_path.name)
+        elif "wechatauto" not in js:
+            missing.append(js_path.name)
+    if applied:
+        log_line(f"octop dashboard patched: {applied}")
+        return True, f"前端补丁已应用（{len(applied)} 个 bundle）"
+    if missing:
+        return False, f"锚点全部缺失：{missing}（Octop 前端改版？人工核查）"
+    return True, "前端补丁已在（幂等跳过）"
+
+
+_ULID_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+
+
+def _new_ulid() -> str:
+    """stdlib ULID（26 字符 Crockford base32：48bit 毫秒 + 80bit 随机）。"""
+    val = ((int(time.time() * 1000) & ((1 << 48) - 1)) << 80) \
+        | int.from_bytes(os.urandom(10), "big")
+    chars = []
+    for _ in range(26):
+        chars.append(_ULID_ALPHABET[val & 31])
+        val >>= 5
+    return "".join(reversed(chars))
+
+
+def _bridge_spawn_cmd(cfg: dict) -> str:
+    """给渠道 config 用的 bridge_cmd：优先本机已装解释器的 pythonw -m 形态。"""
+    exe = find_bridge_exe(cfg)
+    if not exe:
+        return ""
+    argv = _bridge_argv(cfg, exe)
+    return subprocess.list2cmdline(argv)
+
+
+def octop_create_channel_row(cfg: dict) -> tuple[bool, str]:
+    """往 octop.db 直插 wechatauto 渠道行（幂等：已有行不覆盖）。
+
+    必须直插不能走 API：运行中后端的 ChannelKind 枚举是注入前加载的，
+    还不认识 wechatauto，POST 必然 422——注入本来就要求重启才生效，
+    建行放重启前一次性写进 DB，重启后渠道直接注册。"""
+    home = octop_home(cfg)
+    if not home:
+        return False, "未检测到 Octop"
+    db = home / "octop.db"
+    if not db.exists():
+        return False, "octop.db 不存在（先打开一次 Octop 完成初始化）"
+    token = cfg["bridge"]["token"]
+    conn = sqlite3.connect(str(db))
+    try:
+        if conn.execute(
+                "SELECT 1 FROM channels WHERE kind='wechatauto'").fetchone():
+            return True, "渠道行已存在（幂等跳过，不覆盖 config）"
+        row = conn.execute(
+            "SELECT agent_id, user_id FROM agents ORDER BY id LIMIT 1"
+        ).fetchone()
+        if not row:
+            return False, "agents 表为空（先打开一次 Octop 完成初始化）"
+        agent_id, user_id = row
+        config = {
+            "response_mode": "invoke",
+            "show_thinking": False,
+            "show_tool_hints": False,
+            "token": token,
+            "enabled": True,
+            "verify_send": True,
+            "bridge_startup_timeout": 45,
+            "bridge_cmd": _bridge_spawn_cmd(cfg),
+            "group_context": {
+                "enabled": True, "visibility": "all", "activation": "mention",
+                "history": "recent", "history_limit": 10,
+                "history_ttl_seconds": 300,
+            },
+            "group_allow": [],
+        }
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO channels (channel_id, agent_id, user_id, kind, name,"
+            " config_json, enabled, created_at, updated_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?)",
+            (_new_ulid(), agent_id, user_id, "wechatauto",
+             "微信Auto（本地）", json.dumps(config, ensure_ascii=False),
+             1, now, now))
+        conn.commit()
+    except sqlite3.Error as e:
+        return False, f"octop.db 写入失败：{e}"
+    finally:
+        conn.close()
+    log_line("octop channel row created (direct db insert)")
+    return True, "渠道行已写入 octop.db"
+
+
+def _octop_health() -> bool:
+    try:
+        with urllib.request.urlopen(
+                "http://127.0.0.1:8088/api/health", timeout=3) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def _wmi_spawn(cmdline: str, cwd: str) -> int:
+    """WMI Win32_Process.Create——逃逸 Job Object，父进程退出不连坐。"""
+    rc, out = _checked_run(
+        ["powershell", "-NoProfile", "-Command",
+         "$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create "
+         "-Arguments @{ CommandLine = $args[0]; CurrentDirectory = $args[1] };"
+         " $r.ProcessId",
+         "-args", cmdline, cwd], 20)
+    m = re.search(r"\d+", out.strip())
+    return int(m.group()) if (rc == 0 and m) else 0
+
+
+def octop_restart_and_wait(cfg: dict, timeout_s: float = 90) -> tuple[bool, str]:
+    """重启 Octop 后端并等到健康。/update/restart 在 Windows 的 execv
+    会孤儿化后端（实测进程没起来），15s 未恢复就 WMI 原位拉起。"""
+    code, _ = octop_api(cfg, "POST", "/update/restart")
+    deadline = time.time() + timeout_s
+    spawned = False
+    while time.time() < deadline:
+        if _octop_health():
+            return True, "后端已重启"
+        elapsed = timeout_s - (deadline - time.time())
+        if not spawned and elapsed > 15:
+            home = octop_home(cfg)
+            if home:
+                py = home / "portable" / "runtime" / "python.exe"
+                launch = home / "portable" / "launch.py"
+                if py.exists() and launch.exists():
+                    pid = _wmi_spawn(f'"{py}" "{launch}" run',
+                                     str(launch.parent))
+                    spawned = True
+                    log_line(f"octop restart fell back to wmi spawn pid={pid}")
+        time.sleep(2)
+    return False, "重启超时（后端可能已死，可手动拉起 portable/launch.py run）"
+
+
+# Note: 一键接入的设计取舍（为何直插 octop.db 而非 API 建行等）
+# 见 .agents/notes/implemented/feature/2026-10-14-one-click-onboarding.md
+def octop_onboard(cfg: dict) -> tuple[bool, str]:
+    """一键接入 Octop：注入 adapter → 前端补丁 → 建行 → 重启 → 验证。"""
+    st = octop_status(cfg)
+    if not st["installed"]:
+        return False, "未检测到 Octop（先安装并打开一次 Octop）"
+    ok, msg = octop_inject_adapter(cfg)
+    if not ok:
+        return False, f"注入 adapter 失败：{msg}"
+    steps = [msg]
+    fe_ok, fe_msg = octop_patch_frontend(cfg)
+    steps.append(fe_msg if fe_ok else f"前端补丁未打上：{fe_msg}")
+    if st["channel_row"]:
+        steps.append("渠道行已存在")
+    else:
+        ok, msg = octop_create_channel_row(cfg)
+        if not ok:
+            return False, f"建行失败：{msg}（已注入，建行可重试）"
+        steps.append(msg)
+    if _octop_health():
+        ok, msg = octop_restart_and_wait(cfg)
+        steps.append(msg)
+        if not ok:
+            return False, "；".join(steps)
+    else:
+        steps.append("后端未运行——下次启动 Octop 自动生效")
+    st2 = octop_status(cfg)
+    if st2["connected"]:
+        steps.append("渠道已连接 ✓")
+        return True, "；".join(steps)
+    return True, "；".join(steps) + "（连接状态待渠道轮询确认）"
+
+
+def hermes_onboard(cfg: dict) -> tuple[bool, str]:
+    """一键接入 Hermes：注入插件 → 确保 enabled → 重启 gateway。"""
+    ok, msg = hermes_inject_plugin(cfg)
+    if not ok:
+        return False, f"注入插件失败：{msg}"
+    steps = [msg]
+    ok, msg = hermes_set_platform_enabled(cfg, True)
+    if not ok and "没有" in msg:
+        # config.yaml 还没有 platforms.wechatauto 段——补一段再写
+        home = hermes_home(cfg)
+        p = home / "config.yaml" if home else None
+        if p is not None:
+            text = p.read_text(encoding="utf-8") if p.exists() else ""
+            if re.search(r"(?m)^platforms:\s*$", text):
+                text = re.sub(r"(?m)^platforms:\s*$",
+                              "platforms:\n  wechatauto:\n    enabled: true",
+                              text, count=1)
+            else:
+                text += "\nplatforms:\n  wechatauto:\n    enabled: true\n"
+            p.write_text(text, encoding="utf-8")
+            ok, msg = hermes_set_platform_enabled(cfg, True)
+    steps.append(msg)
+    if not ok:
+        return False, "；".join(steps)
+    ok, msg = hermes_gateway_restart(cfg)
+    steps.append(f"gateway 重启：{msg}")
+    return ok, "；".join(steps)
+
+
+# ---------------------------------------------------------------------------
+# OpenClaw 一键接入
+# ---------------------------------------------------------------------------
+
+
+def openclaw_onboard(cfg: dict) -> tuple[bool, str]:
+    """一键接入 OpenClaw：plugins install + config set 写桥地址和 token。"""
+    exe = shutil.which("openclaw") or shutil.which("openclaw.cmd")
+    if not exe:
+        return False, "未检测到 openclaw CLI（先 npm i -g openclaw）"
+    repo = cfg.get("repo_root") or ""
+    src = Path(repo) / "openclaw" / "openclaw-wechatauto" if repo else None
+    if not src or not src.exists():
+        return False, "找不到插件目录 openclaw/openclaw-wechatauto（检查 repo_root）"
+    b = cfg["bridge"]
+    cmds = [
+        ([exe, "plugins", "install", str(src)], "插件已安装"),
+        ([exe, "config", "set", "plugins.entries.wechatauto.enabled", "true"],
+         "插件已启用"),
+        ([exe, "config", "set", "channels.wechatauto.bridgeUrl",
+          f"http://{b['host']}:{b['port']}"], "桥地址已写入"),
+        ([exe, "config", "set", "channels.wechatauto.bridgeToken",
+          b["token"]], "桥 token 已写入"),
+        ([exe, "config", "set", "channels.wechatauto.enabled", "true"],
+         "渠道已启用"),
+    ]
+    steps = []
+    for argv, desc in cmds:
+        rc, out = _checked_run(argv, 120)
+        if rc != 0:
+            return False, (f"{' '.join(argv[1:3])} 失败 rc={rc}："
+                           f"{out.strip()[-200:]}（已完成：{'；'.join(steps)}）")
+        steps.append(desc)
+    log_line("openclaw onboard done")
+    return True, "；".join(steps) + "（重启 openclaw 生效）"
+
+
 def _octop_adapter_src(cfg: dict) -> Path | None:
     """定位 adapter 源码目录：octop_repo 显式 > repo_root/octop/ 布局 >
     repo_root 兄弟的 octop-gateway/src/ 布局 > ~/.wechatauto 金本。"""

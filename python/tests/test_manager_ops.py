@@ -463,5 +463,299 @@ class TestOpenClawDetect(unittest.TestCase):
         self.assertIn("plugin", st)
 
 
+class TestOctopFrontendPatch(unittest.TestCase):
+    """dashboard index.*.js 的 wechatauto 渠道卡片补丁：锚点插入 + 幂等。"""
+
+    JS = (
+        'const CHANNEL_KEYS=["weixin","mqtt"],'
+        'CHANNEL_LABEL_KEYS={weixin:"channels.label_weixin"},'
+        'CHANNEL_LABELS={weixin:"微信"},'
+        'CHANNEL_ICONS={weixin:weixinIcon},'
+        'CHANNEL_URLS={weixin:"https://x"},'
+        'F={xiaoyi:[{name:"ak"}],mqtt:[{name:"host",label:"Broker"}]};'
+    )
+
+    def _mk(self, tmp, js=None):
+        home = Path(tmp) / ".octop"
+        assets = (home / "portable" / "packages" / "octop" / "dashboard"
+                  / "assets")
+        assets.mkdir(parents=True)
+        target = assets / "index.abc.js"
+        target.write_text(js if js is not None else self.JS,
+                          encoding="utf-8")
+        return copy.deepcopy(ops.DEFAULT_CFG | {"octop_home": str(home)}), target
+
+    def test_patches_all_anchors(self):
+        cfg, js_path = self._mk(tempfile.mkdtemp())
+        ok, msg = ops.octop_patch_frontend(cfg)
+        self.assertTrue(ok, msg)
+        js = js_path.read_text(encoding="utf-8")
+        self.assertIn('"wechatauto"', js)
+        self.assertIn('wechatauto:"微信Auto"', js)
+        self.assertIn('wechatauto:weixinIcon', js)
+        self.assertIn('wechatauto:[{name:"base_url"', js)
+        self.assertIn('wechatauto:"https://github.com/luxi233/'
+                      'wechatauto-channels"', js)
+
+    def test_idempotent(self):
+        cfg, js_path = self._mk(tempfile.mkdtemp())
+        ops.octop_patch_frontend(cfg)
+        once = js_path.read_text(encoding="utf-8")
+        ok, msg = ops.octop_patch_frontend(cfg)
+        self.assertTrue(ok)
+        self.assertIn("幂等", msg)
+        self.assertEqual(js_path.read_text(encoding="utf-8"), once)
+
+    def test_no_bundle_fails(self):
+        home = Path(tempfile.mkdtemp()) / ".octop"
+        home.mkdir(parents=True)
+        cfg = copy.deepcopy(ops.DEFAULT_CFG | {"octop_home": str(home)})
+        ok, _ = ops.octop_patch_frontend(cfg)
+        self.assertFalse(ok)
+
+    def test_missing_anchors_report(self):
+        cfg, _ = self._mk(tempfile.mkdtemp(), js='const X={a:1};')
+        ok, msg = ops.octop_patch_frontend(cfg)
+        self.assertFalse(ok)
+        self.assertIn("锚点", msg)
+
+
+class TestOctopChannelRow(unittest.TestCase):
+    """建行：直插 octop.db，幂等不覆盖既有 config（保护 group_allow）。"""
+
+    def _mk(self, tmp):
+        home = Path(tmp) / ".octop"
+        home.mkdir()
+        conn = sqlite3.connect(str(home / "octop.db"))
+        conn.executescript("""
+            CREATE TABLE agents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT UNIQUE, user_id INT);
+            INSERT INTO agents (agent_id, user_id) VALUES ('main', 1);
+            CREATE TABLE channels (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_id TEXT NOT NULL UNIQUE,
+                agent_id TEXT NOT NULL, user_id INTEGER NOT NULL,
+                kind TEXT NOT NULL, name TEXT NOT NULL,
+                config_json TEXT NOT NULL, enabled INTEGER NOT NULL,
+                created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+                UNIQUE(agent_id, name));
+        """)
+        conn.commit()
+        conn.close()
+        return copy.deepcopy(ops.DEFAULT_CFG | {"octop_home": str(home)}), home
+
+    def test_creates_row_with_bridge_config(self):
+        cfg, home = self._mk(tempfile.mkdtemp())
+        ok, msg = ops.octop_create_channel_row(cfg)
+        self.assertTrue(ok, msg)
+        conn = sqlite3.connect(str(home / "octop.db"))
+        row = conn.execute(
+            "SELECT channel_id, agent_id, kind, enabled, config_json"
+            " FROM channels WHERE kind='wechatauto'").fetchone()
+        conn.close()
+        self.assertIsNotNone(row)
+        self.assertEqual(row[1], "main")
+        self.assertEqual(row[3], 1)
+        conf = json.loads(row[4])
+        self.assertEqual(conf["token"], "octop-e2e-token")
+        self.assertTrue(conf["verify_send"])
+        self.assertIn("group_context", conf)
+
+    def test_idempotent_preserves_existing(self):
+        cfg, home = self._mk(tempfile.mkdtemp())
+        conn = sqlite3.connect(str(home / "octop.db"))
+        conn.execute(
+            "INSERT INTO channels (channel_id, agent_id, user_id, kind,"
+            " name, config_json, enabled, created_at, updated_at)"
+            " VALUES ('EXISTING','main',1,'wechatauto','旧',"
+            " '{\"group_allow\":[\"111@chatroom\"]}',1,1,1)")
+        conn.commit()
+        conn.close()
+        ok, msg = ops.octop_create_channel_row(cfg)
+        self.assertTrue(ok)
+        self.assertIn("已存在", msg)
+        conn = sqlite3.connect(str(home / "octop.db"))
+        n = conn.execute(
+            "SELECT COUNT(*) FROM channels WHERE kind='wechatauto'"
+        ).fetchone()[0]
+        conf = conn.execute(
+            "SELECT config_json FROM channels WHERE channel_id='EXISTING'"
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(n, 1)
+        self.assertIn("111@chatroom", conf)
+
+    def test_no_agents_fails(self):
+        cfg, home = self._mk(tempfile.mkdtemp())
+        conn = sqlite3.connect(str(home / "octop.db"))
+        conn.execute("DELETE FROM agents")
+        conn.commit()
+        conn.close()
+        ok, msg = ops.octop_create_channel_row(cfg)
+        self.assertFalse(ok)
+
+
+class TestOctopOnboard(unittest.TestCase):
+    """一键接入编排：注入+前端补丁+建行；后端不在线时停在建行后。"""
+
+    def _mk(self, tmp):
+        home = Path(tmp) / ".octop"
+        pkg = (home / "portable" / "packages" / "octop_gateway" / "channels")
+        pkg.mkdir(parents=True)
+        (pkg / "__init__.py").write_text(
+            '_CHANNEL_MAP: dict[str, str] = {\n'
+            '    "weixin": "octop_gateway.channels.weixin",\n'
+            '}\n\n'
+            'class ChannelKind(StrEnum):\n'
+            '    WEIXIN = "weixin"\n\n\n'
+            '_CLASS_NAMES: dict[str, str] = {\n'
+            '    "weixin": "WeixinChannel",\n'
+            '}\n', encoding="utf-8")
+        assets = (home / "portable" / "packages" / "octop" / "dashboard"
+                  / "assets")
+        assets.mkdir(parents=True)
+        (assets / "index.x.js").write_text(
+            TestOctopFrontendPatch.JS, encoding="utf-8")
+        conn = sqlite3.connect(str(home / "octop.db"))
+        conn.executescript("""
+            CREATE TABLE agents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT UNIQUE, user_id INT);
+            INSERT INTO agents (agent_id, user_id) VALUES ('main', 1);
+            CREATE TABLE channels (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_id TEXT NOT NULL UNIQUE,
+                agent_id TEXT NOT NULL, user_id INTEGER NOT NULL,
+                kind TEXT NOT NULL, name TEXT NOT NULL,
+                config_json TEXT NOT NULL, enabled INTEGER NOT NULL,
+                created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+                UNIQUE(agent_id, name));
+        """)
+        conn.commit()
+        conn.close()
+        # adapter 源码（cfg["octop_repo"] 指定）
+        repo = Path(tmp) / "octop-gateway"
+        src = (repo / "src" / "octop_gateway" / "channels" / "wechatauto")
+        src.mkdir(parents=True)
+        (src / "channel.py").write_text("# adapter", encoding="utf-8")
+        cfg = copy.deepcopy(ops.DEFAULT_CFG | {
+            "octop_home": str(home), "octop_repo": str(repo)})
+        return cfg, home
+
+    def test_full_onboard_offline_backend(self):
+        cfg, home = self._mk(tempfile.mkdtemp())
+        with mock.patch.object(ops, "_octop_health", return_value=False):
+            ok, msg = ops.octop_onboard(cfg)
+        self.assertTrue(ok, msg)
+        self.assertIn("已注入", msg)
+        self.assertIn("octop.db", msg)
+        # adapter 文件真的进去了 + __init__ 三处注册
+        ch = (home / "portable" / "packages" / "octop_gateway" / "channels")
+        self.assertTrue((ch / "wechatauto" / "channel.py").exists())
+        init = (ch / "__init__.py").read_text(encoding="utf-8")
+        self.assertIn('"wechatauto": "octop_gateway.channels.wechatauto"',
+                      init)
+        # 渠道行已建
+        conn = sqlite3.connect(str(home / "octop.db"))
+        row = conn.execute(
+            "SELECT kind FROM channels WHERE kind='wechatauto'").fetchone()
+        conn.close()
+        self.assertIsNotNone(row)
+        # 前端补丁打了
+        js = (home / "portable" / "packages" / "octop" / "dashboard"
+              / "assets" / "index.x.js").read_text(encoding="utf-8")
+        self.assertIn('"wechatauto"', js)
+
+    def test_onboard_not_installed(self):
+        cfg = copy.deepcopy(ops.DEFAULT_CFG | {"octop_home": "/nonexistent"})
+        ok, msg = ops.octop_onboard(cfg)
+        self.assertFalse(ok)
+
+
+class TestOpenClawOnboard(unittest.TestCase):
+    def _mk(self, tmp):
+        repo = Path(tmp) / "repo"
+        src = repo / "openclaw" / "openclaw-wechatauto"
+        src.mkdir(parents=True)
+        (src / "openclaw.plugin.json").write_text("{}")
+        cfg = copy.deepcopy(ops.DEFAULT_CFG | {"repo_root": str(repo)})
+        return cfg
+
+    def test_runs_install_and_config_sets(self):
+        cfg = self._mk(tempfile.mkdtemp())
+        calls = []
+
+        def fake_run(argv, timeout):
+            calls.append(argv)
+            return 0, "ok"
+
+        with mock.patch.object(ops.shutil, "which",
+                               return_value="C:\\oc\\openclaw.exe"), \
+                mock.patch.object(ops, "_checked_run", fake_run):
+            ok, msg = ops.openclaw_onboard(cfg)
+        self.assertTrue(ok, msg)
+        self.assertEqual(len(calls), 5)
+        self.assertEqual(calls[0][1:3], ["plugins", "install"])
+        self.assertEqual(calls[3][1:3], ["config", "set"])
+        self.assertIn("bridgeToken", calls[3][3])
+        self.assertEqual(calls[3][4], "octop-e2e-token")
+
+    def test_missing_cli(self):
+        cfg = self._mk(tempfile.mkdtemp())
+        with mock.patch.object(ops.shutil, "which", return_value=None):
+            ok, msg = ops.openclaw_onboard(cfg)
+        self.assertFalse(ok)
+        self.assertIn("openclaw", msg)
+
+    def test_install_failure_reports_step(self):
+        cfg = self._mk(tempfile.mkdtemp())
+        calls = []
+
+        def fake_run(argv, timeout):
+            calls.append(argv)
+            return (1, "boom") if "install" in argv else (0, "ok")
+
+        with mock.patch.object(ops.shutil, "which",
+                               return_value="openclaw"), \
+                mock.patch.object(ops, "_checked_run", fake_run):
+            ok, msg = ops.openclaw_onboard(cfg)
+        self.assertFalse(ok)
+        self.assertIn("boom", msg)
+
+
+class TestHermesOnboard(unittest.TestCase):
+    def _mk(self, tmp, yaml_text):
+        home = Path(tmp) / "hermes"
+        (home / "hermes-agent" / "venv" / "Scripts").mkdir(parents=True)
+        (home / "hermes-agent" / "venv" / "Scripts" / "hermes.exe"
+         ).write_text("x")
+        (home / "config.yaml").write_text(yaml_text, encoding="utf-8")
+        repo = Path(tmp) / "repo"
+        plug = repo / "hermes" / "wechatauto"
+        plug.mkdir(parents=True)
+        (plug / "adapter.py").write_text("# plugin", encoding="utf-8")
+        cfg = copy.deepcopy(ops.DEFAULT_CFG | {
+            "hermes_home": str(home), "repo_root": str(repo)})
+        return cfg, home
+
+    def test_onboard_inject_enable_restart(self):
+        cfg, home = self._mk(tempfile.mkdtemp(), "platforms:\n  weixin:\n    enabled: true\n")
+        with mock.patch.object(ops, "_checked_run",
+                               return_value=(0, "ok")):
+            ok, msg = ops.hermes_onboard(cfg)
+        self.assertTrue(ok, msg)
+        self.assertTrue(
+            (home / "plugins" / "wechatauto" / "adapter.py").exists())
+        text = (home / "config.yaml").read_text(encoding="utf-8")
+        self.assertIn("wechatauto:\n    enabled: true", text)
+        self.assertIn("weixin:\n    enabled: true", text)
+
+    def test_onboard_missing_hermes(self):
+        cfg = copy.deepcopy(ops.DEFAULT_CFG | {"hermes_home": "/nonexistent"})
+        ok, _ = ops.hermes_onboard(cfg)
+        self.assertFalse(ok)
+
+
 if __name__ == "__main__":
     unittest.main()

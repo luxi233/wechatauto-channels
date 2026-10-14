@@ -60,6 +60,36 @@ HTTP 桥消费同一套逻辑（Octop 适配器源码在
 - 发送路径（UIA+OCR）额外需要：`pip install winsdk pypinyin`
 - ⚠️ 不要以管理员身份运行 gateway/bridge——提权进程读不到普通权限微信的内存密钥
 
+## 一键安装（推荐）
+
+下载 release zip（或 clone 仓库）后**双击根目录 `install.bat`**：
+
+```
+install.bat 做的事：
+  1. 找可用 Python——Hermes venv → Octop portable runtime →
+     ~/.wechatauto/venv → py launcher / PATH 上的 python
+  2. pip install wechatauto-channels[send-ocr] 到对应环境
+     （Hermes 机器装进 Hermes 的 venv；纯 Octop 机器自建 ~/.wechatauto/venv）
+  3. 写 repo_root 到 ~/.wechatauto/manager.json
+  4. 注册开机自启（管理台 + 桥守护）
+  5. 拉起管理台 GUI
+```
+
+之后按这台机器装了什么宿主，在管理台对应页签点**一键接入**：
+
+| 页签 | 一键接入做的事 |
+|---|---|
+| Hermes | 拷贝 `hermes/wechatauto/` 插件 + `plugins.enabled` 白名单 + `platforms.wechatauto.enabled=true` + 重启 gateway |
+| Octop | 注入 adapter 到 portable 包 + `channels/__init__.py` 三处注册 + dashboard 前端补丁（渠道卡片可见）+ 直插 `octop.db` 渠道行（含 token/bridge_cmd）+ 重启后端并验证连接 |
+| OpenClaw | `openclaw plugins install` + `config set` 写 bridgeUrl/bridgeToken/enabled（需已装 openclaw CLI） |
+
+补丁层（replica_compat / harness patches）随包分发、import 自应用，
+安装器无需特殊处理；Octop 升级后 watchdog 自动重注入并核查补丁存活。
+
+### 手动安装（开发者）
+
+以下各节是逐条命令的手动路径，等价于一键安装的分解动作。
+
 ## Hermes
 
 把 `hermes/wechatauto/` 整个目录放进 `~/.hermes/plugins/`：

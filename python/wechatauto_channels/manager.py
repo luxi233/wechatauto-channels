@@ -99,6 +99,10 @@ class ManagerApp(tk.Tk):
         self.h_status.pack(fill="x")
         row = ttk.Frame(f)
         row.pack(fill="x", pady=6)
+        ttk.Button(row, text="一键接入（装插件+启用+重启）",
+                   command=lambda: self._run_bg(
+                       ops.hermes_onboard, "一键接入 Hermes")).pack(
+            side="left", padx=4)
         ttk.Button(row, text="注入插件",
                    command=lambda: self._run_bg(
                        ops.hermes_inject_plugin, "注入插件")).pack(
@@ -124,6 +128,10 @@ class ManagerApp(tk.Tk):
         self.o_status.pack(fill="x")
         row = ttk.Frame(f)
         row.pack(fill="x", pady=6)
+        ttk.Button(row, text="一键接入（注入+建行+重启）",
+                   command=lambda: self._run_bg(
+                       ops.octop_onboard, "一键接入 Octop")).pack(
+            side="left", padx=4)
         ttk.Button(row, text="注入 adapter",
                    command=lambda: self._run_bg(
                        ops.octop_inject_adapter, "注入 adapter")).pack(
@@ -170,12 +178,18 @@ class ManagerApp(tk.Tk):
         self.c_status = tk.Text(f, height=10, width=90, state="disabled",
                                 font=("Consolas", 9))
         self.c_status.pack(fill="x")
+        row = ttk.Frame(f)
+        row.pack(fill="x", pady=6)
+        ttk.Button(row, text="一键接入（装插件+写配置）",
+                   command=lambda: self._run_bg(
+                       ops.openclaw_onboard, "一键接入 OpenClaw")).pack(
+            side="left", padx=4)
         tk.Label(
             f, fg=GREY, justify="left",
-            text="OpenClaw 插件是 npm 包（openclaw-wechatauto），"
-                 "经 HTTP 桥接入本机。\n"
-                 "安装后此页会显示检测状态；未安装时可运行\n"
-                 "  npm i -g openclaw-wechatauto").pack(anchor="w", pady=8)
+            text="OpenClaw 插件是本地 npm 包（openclaw-wechatauto，未发 registry），\n"
+                 "经 HTTP 桥接入本机。前置：已装 openclaw CLI。\n"
+                 "「一键接入」会从仓库 openclaw/openclaw-wechatauto 安装并写好桥配置。").pack(
+            anchor="w", pady=8)
 
     def _build_log_tab(self, nb):
         f = ttk.Frame(nb, padding=6)
