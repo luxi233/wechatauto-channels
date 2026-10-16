@@ -198,14 +198,50 @@ def bridge_health(cfg: dict, timeout: float = 5.0) -> dict | None:
         return None
 
 
-def _bridge_running() -> bool:
+def _bridge_running(cfg: dict | None = None) -> bool:
     """桥在跑 = 端口能建立 TCP 连接（比按进程名找更准，pythonw 形态也覆盖）。"""
     import socket
+    bridge = (cfg or DEFAULT_CFG)["bridge"]
     try:
-        with socket.create_connection(("127.0.0.1", 18765), timeout=1):
+        with socket.create_connection(
+                (bridge["host"], int(bridge["port"])), timeout=1):
             return True
     except OSError:
         return False
+
+
+def manager_status(cfg: dict) -> dict:
+    """采集管理台状态；单个探针失败不得冻结整张状态卡。"""
+    # Note: 健康探针超时不等于进程离线，状态卡采用三态语义 — 见
+    # .agents/notes/implemented/bug-fix/2026-10-16-manager-false-offline.md
+    status: dict = {}
+    probes = {
+        "wechat": (False, wechat_running),
+        "hermes": ({"installed": False, "plugin": False,
+                    "whitelisted": False, "platform_enabled": None,
+                    "connected": None, "home": ""},
+                   lambda: hermes_status(cfg)),
+        "octop": ({"installed": False, "adapter_files": False,
+                   "registered": False, "channel_row": False,
+                   "connected": None, "name": "", "channel_id": "",
+                   "home": "", "frontend_patched": False,
+                   "backend_online": False},
+                  lambda: octop_status(cfg)),
+        "openclaw": ({"installed": False, "plugin": False, "home": ""},
+                     lambda: openclaw_status(cfg)),
+    }
+    health = bridge_health(cfg)
+    status["bridge"] = health or {
+        "ok": False,
+        "reachable": _bridge_running(cfg),
+    }
+    for name, (fallback, probe) in probes.items():
+        try:
+            status[name] = probe()
+        except Exception as exc:  # noqa: BLE001 - 状态页必须部分可用
+            log_line(f"status probe [{name}] failed: {type(exc).__name__}: {exc}")
+            status[name] = fallback
+    return status
 
 
 def bridge_pid() -> int | None:
@@ -487,7 +523,8 @@ def octop_status(cfg: dict) -> dict:
     home = octop_home(cfg)
     st = {"installed": False, "adapter_files": False, "registered": False,
           "channel_row": False, "connected": None, "name": "",
-          "channel_id": "", "home": str(home or ""), "frontend_patched": False}
+          "channel_id": "", "home": str(home or ""), "frontend_patched": False,
+          "backend_online": False}
     if not home:
         return st
     pkg = home / "portable" / "packages" / "octop_gateway"
@@ -521,6 +558,7 @@ def octop_status(cfg: dict) -> dict:
             st["channel_row"] = True
             st["channel_id"], st["name"] = row[0], row[1]
     if st["channel_row"]:
+        st["backend_online"] = _octop_health()
         code, payload = octop_api(
             cfg, "GET", "/agents/main/channels")
         if code == 200 and isinstance(payload, list):

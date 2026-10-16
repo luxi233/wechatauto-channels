@@ -72,7 +72,8 @@ install.bat 做的事：
      （Hermes 机器装进 Hermes 的 venv；纯 Octop 机器自建 ~/.wechatauto/venv）
   3. 写 repo_root 到 ~/.wechatauto/manager.json
   4. 注册开机自启（管理台 + 桥守护）
-  5. 拉起管理台 GUI
+  5. 在当前用户桌面创建「WeChatAuto 管理台」快捷方式
+  6. 拉起管理台 GUI
 ```
 
 之后按这台机器装了什么宿主，在管理台对应页签点**一键接入**：

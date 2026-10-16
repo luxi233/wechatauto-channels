@@ -47,6 +47,53 @@ class TestMintJwt(unittest.TestCase):
         self.assertEqual(len(token.split(".")), 3)
 
 
+class TestManagerStatus(unittest.TestCase):
+    def setUp(self):
+        self.cfg = copy.deepcopy(ops.DEFAULT_CFG)
+
+    @mock.patch.object(ops, "openclaw_status", return_value={"installed": False})
+    @mock.patch.object(ops, "octop_status", return_value={
+        "connected": True, "backend_online": True})
+    @mock.patch.object(ops, "hermes_status", return_value={"installed": True})
+    @mock.patch.object(ops, "wechat_running", return_value=True)
+    @mock.patch.object(ops, "_bridge_running", return_value=True)
+    @mock.patch.object(ops, "bridge_health", return_value=None)
+    def test_health_timeout_with_live_port_is_busy_not_offline(
+            self, _health, _running, _wechat, _hermes, _octop, _openclaw):
+        status = ops.manager_status(self.cfg)
+        self.assertFalse(status["bridge"]["ok"])
+        self.assertTrue(status["bridge"]["reachable"])
+        self.assertTrue(status["octop"]["connected"])
+
+    @mock.patch.object(ops, "openclaw_status", return_value={"installed": False})
+    @mock.patch.object(ops, "octop_status", return_value={
+        "connected": True, "backend_online": True})
+    @mock.patch.object(ops, "hermes_status", side_effect=RuntimeError("boom"))
+    @mock.patch.object(ops, "wechat_running", return_value=True)
+    @mock.patch.object(ops, "bridge_health", return_value={"ok": True})
+    def test_one_probe_failure_keeps_other_statuses(
+            self, _health, _wechat, _hermes, _octop, _openclaw):
+        status = ops.manager_status(self.cfg)
+        self.assertTrue(status["bridge"]["ok"])
+        self.assertTrue(status["octop"]["connected"])
+        self.assertFalse(status["hermes"]["installed"])
+        self.assertEqual(status["hermes"]["home"], "")
+        self.assertFalse(status["hermes"]["plugin"])
+
+    @mock.patch.object(ops, "openclaw_status", return_value={"installed": False})
+    @mock.patch.object(ops, "octop_status", return_value={
+        "installed": True, "channel_row": True, "connected": None,
+        "backend_online": True})
+    @mock.patch.object(ops, "hermes_status", return_value={"installed": True})
+    @mock.patch.object(ops, "wechat_running", return_value=True)
+    @mock.patch.object(ops, "bridge_health", return_value={"ok": True})
+    def test_octop_backend_online_is_preserved_when_runtime_is_unknown(
+            self, _health, _wechat, _hermes, _octop, _openclaw):
+        status = ops.manager_status(self.cfg)
+        self.assertIsNone(status["octop"]["connected"])
+        self.assertTrue(status["octop"]["backend_online"])
+
+
 class TestHermesToggle(unittest.TestCase):
     YAML = (
         "plugins:\n"

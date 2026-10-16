@@ -9,7 +9,8 @@ rem    2. pip-installs wechatauto-channels[send-ocr]
 rem    3. writes repo_root into ~/.wechatauto/manager.json
 rem    4. registers the manager in Startup (bridge watchdog lives
 rem       inside the manager)
-rem    5. launches the manager GUI
+rem    5. creates a desktop shortcut
+rem    6. launches the manager GUI
 rem
 rem  Per-host integration (Hermes plugin / Octop channel /
 rem  OpenClaw plugin) is then one button inside the manager GUI.
@@ -100,6 +101,15 @@ for %%I in ("%TARGET%") do set "PYW=%%~dpIpythonw.exe"
 > "%STARTUP%\wechatauto-manager.bat" echo @echo off
 >>"%STARTUP%\wechatauto-manager.bat" echo start "" "%PYW%" -m wechatauto_channels.manager
 echo [wechatauto] autostart registered: %STARTUP%\wechatauto-manager.bat
+
+rem -- desktop shortcut: keep the manager discoverable after installation --
+rem Note: one-click install must leave a discoverable entry point; see the onboarding Agent Note.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$ws=New-Object -ComObject WScript.Shell; $name='WeChatAuto '+[char]0x7BA1+[char]0x7406+[char]0x53F0+'.lnk'; $lnk=$ws.CreateShortcut([IO.Path]::Combine([Environment]::GetFolderPath('Desktop'),$name)); $lnk.TargetPath='%PYW%'; $lnk.Arguments='-m wechatauto_channels.manager --respawn'; $lnk.WorkingDirectory='%USERPROFILE%'; $lnk.Description='WeChatAuto channel manager'; $lnk.IconLocation='$env:SystemRoot\System32\shell32.dll,44'; $lnk.Save()"
+if errorlevel 1 (
+  echo [wechatauto] WARN: could not create desktop shortcut
+) else (
+  echo [wechatauto] desktop shortcut created
+)
 
 rem -- launch the manager GUI --
 start "" "%PYW%" -m wechatauto_channels.manager

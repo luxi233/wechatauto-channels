@@ -360,7 +360,7 @@ class ManagerApp(tk.Tk):
                 # /health 超时 ≠ 桥死：DB 合并/UIA 卡顿会让响应超 5s。
                 # 进程活着时乱 spawn 只会产锁死失败者（spawn-die 抖动）。
                 # TCP 能连上 = 进程在——记一笔，不动手。
-                if ops._bridge_running():
+                if ops._bridge_running(self.cfg):
                     ops.log_line(
                         "watchdog: /health 超时但端口活着——跳过拉起")
                     continue
@@ -461,13 +461,7 @@ class ManagerApp(tk.Tk):
 
     def _refresh_loop(self):
         def probe():
-            st = {
-                "wechat": ops.wechat_running(),
-                "bridge": ops.bridge_health(self.cfg),
-                "hermes": ops.hermes_status(self.cfg),
-                "octop": ops.octop_status(self.cfg),
-                "openclaw": ops.openclaw_status(self.cfg),
-            }
+            st = ops.manager_status(self.cfg)
             self._ui_queue.put(("status", st))
         threading.Thread(target=probe, daemon=True).start()
         self.after(8000, self._refresh_loop)
@@ -483,6 +477,8 @@ class ManagerApp(tk.Tk):
         h = st["bridge"]
         if h and h.get("ok"):
             self._set_status("bridge", f"正常 {h.get('nickname','')}", GREEN)
+        elif h and h.get("reachable"):
+            self._set_status("bridge", "忙碌（端口在线）", ORANGE)
         else:
             self._set_status("bridge", "离线", RED)
         hs = st["hermes"]
@@ -499,6 +495,8 @@ class ManagerApp(tk.Tk):
             self._set_status("octop", "未安装", GREY)
         elif os_["connected"]:
             self._set_status("octop", "已连接", GREEN)
+        elif os_.get("backend_online") and os_["channel_row"]:
+            self._set_status("octop", "后端在线（渠道待确认）", ORANGE)
         elif os_["channel_row"]:
             self._set_status("octop", "已断开", RED)
         else:
